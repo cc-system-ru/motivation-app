@@ -1,501 +1,646 @@
+import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
+from io import BytesIO
+
 import pandas as pd
 import streamlit as st
 
-# Настройка страницы
-st.set_page_config(
-    page_title="Система мотивации", page_icon="💼", layout="wide"
+from motivation_engine import (
+    DEFAULT_RULES,
+    ROLES,
+    compute,
+    default_rules,
+    lookup,
+    param_value,
 )
 
-DB_NAME = "motivation.db"
+st.set_page_config(page_title="Система мотивации", page_icon="💼", layout="wide")
+
+DB_PATH = "motivation.db"
+ADMIN_PASSWORD = "admin"
+
+SEED_EMPLOYEES = [
+    ("Мамий Инвер", "Андеррайтер"),
+    ("Серёгин Евгений", "Андеррайтер"),
+    ("Щербань Дмитрий", "Андеррайтер"),
+    ("Кирсанов Данил", "Старший андеррайтер"),
+    ("Вадим", "Менеджер по продажам (МОП)"),
+    ("Данил", "Менеджер по продажам (МОП)"),
+    ("Александр", "Менеджер по продажам (МОП)"),
+    ("Антон", "Менеджер по продажам (МОП)"),
+    ("Руслан", "Коммерческий директор"),
+    ("Владимир", "Операционный директор"),
+]
 
 
-# Инициализация базы данных
+# ---------------------------------------------------------------- БАЗА
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def init_db():
-  conn = sqlite3.connect(DB_NAME)
-  cursor = conn.cursor()
-
-  # Таблица сотрудников
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fio TEXT NOT NULL,
-            role TEXT NOT NULL,
-            status TEXT DEFAULT 'Активен'
+    with db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS employees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fio TEXT NOT NULL,
+                role TEXT NOT NULL,
+                status TEXT DEFAULT 'Активен',
+                hired TEXT,
+                note TEXT
+            );
+            CREATE TABLE IF NOT EXISTS rule_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                start_period TEXT NOT NULL,
+                rules TEXT NOT NULL,
+                UNIQUE(role, start_period)
+            );
+            CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period TEXT NOT NULL,
+                employee_id INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(period, employee_id)
+            );
+            CREATE TABLE IF NOT EXISTS calculations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period TEXT NOT NULL,
+                employee_id INTEGER NOT NULL,
+                fio TEXT,
+                role TEXT,
+                result TEXT NOT NULL,
+                snapshot_at TEXT,
+                UNIQUE(period, employee_id)
+            );
+            CREATE TABLE IF NOT EXISTS closed_periods (
+                period TEXT PRIMARY KEY,
+                closed_at TEXT
+            );
+            """
         )
-    """)
-
-  # Таблица настроек мотивации (версионность по периодам)
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS motivation_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            role TEXT NOT NULL,
-            start_period TEXT NOT NULL, -- формат ГГГГ-ММ
-            param_name TEXT NOT NULL,
-            param_value REAL NOT NULL
-        )
-    """)
-
-  # Таблица закрытых периодов
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS closed_periods (
-            period TEXT PRIMARY KEY
-        )
-    """)
-
-  # Таблица сохраненных расчетов (история)
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS calculations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            period TEXT NOT NULL,
-            employee_id INTEGER,
-            fio TEXT,
-            role TEXT,
-            base_salary REAL,
-            discipline_penalty REAL,
-            bonus REAL,
-            additional_pay REAL,
-            total_payout REAL,
-            details TEXT,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        )
-    """)
-  conn.commit()
-  conn.close()
+        if conn.execute("SELECT COUNT(*) c FROM employees").fetchone()["c"] == 0:
+            conn.executemany(
+                "INSERT INTO employees (fio, role, status) VALUES (?,?, 'Активен')",
+                SEED_EMPLOYEES,
+            )
+        for role in ROLES:
+            if not conn.execute(
+                "SELECT 1 FROM rule_versions WHERE role=?", (role,)
+            ).fetchone():
+                conn.execute(
+                    "INSERT INTO rule_versions (role, start_period, rules) VALUES (?,?,?)",
+                    (role, "2026-01", json.dumps(default_rules(role), ensure_ascii=False)),
+                )
 
 
 init_db()
 
-# Пароль руководителя
-ADMIN_PASSWORD = "admin"  # Можете изменить на свой
 
-# Авторизация
-if "authenticated" not in st.session_state:
-  st.session_state["authenticated"] = False
+def load_rules(role, period):
+    """Правила роли, действующие в указанном периоде."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT rules FROM rule_versions WHERE role=? AND start_period<=? "
+            "ORDER BY start_period DESC LIMIT 1",
+            (role, period),
+        ).fetchone()
+        if row:
+            return json.loads(row["rules"])
+    return default_rules(role)
 
-if not st.session_state["authenticated"]:
-  st.markdown("## 🔐 Вход в систему мотивации")
-  password = st.text_input("Введите пароль руководителя:", type="password")
-  if st.button("Войти"):
-    if password == ADMIN_PASSWORD:
-      st.session_state["authenticated"] = True
-      st.rerun()
-    else:
-      st.error("Неверный пароль")
-  st.stop()
 
-# Главное меню
-st.sidebar.title("📌 Навигация")
-menu = st.sidebar.selectbox(
-    "Выберите раздел",
-    [
-        "👥 Сотрудники",
-        "⚙️ Настройки мотивации",
-        "🧮 Расчет зарплаты",
-        "📊 Итоги и закрытие периода",
-    ],
-)
+def rule_versions(role):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM rule_versions WHERE role=? ORDER BY start_period",
+            (role,),
+        ).fetchall()
 
-if st.sidebar.button("Выйти из системы"):
-  st.session_state["authenticated"] = False
-  st.rerun()
 
-# ----------------------------------------------------
-# 1. СОТРУДНИКИ
-# ----------------------------------------------------
-if menu == "👥 Сотрудники":
-  st.header("👥 Управление сотрудниками")
+def save_rules(role, period, rules):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO rule_versions (role, start_period, rules) VALUES (?,?,?) "
+            "ON CONFLICT(role, start_period) DO UPDATE SET rules=excluded.rules",
+            (role, period, json.dumps(rules, ensure_ascii=False)),
+        )
 
-  conn = sqlite3.connect(DB_NAME)
-  df_emp = pd.read_sql("SELECT * FROM employees", conn)
-  conn.close()
 
-  with st.form("add_employee_form"):
-    st.subheader("Добавить нового сотрудника")
-    new_fio = st.text_input("ФИО сотрудника")
-    new_role = st.selectbox(
-        "Роль",
-        [
-            "Операционный директор",
-            "Андеррайтер",
-            "Старший андеррайтер",
-            "Региональный представитель",
-            "Менеджер по продажам (МОП)",
-            "Коммерческий директор",
-        ],
+def employees(active_only=False):
+    q = "SELECT * FROM employees"
+    if active_only:
+        q += " WHERE status='Активен'"
+    with db() as conn:
+        return [dict(r) for r in conn.execute(q + " ORDER BY role, fio")]
+
+
+def is_closed(period):
+    with db() as conn:
+        return (
+            conn.execute(
+                "SELECT 1 FROM closed_periods WHERE period=?", (period,)
+            ).fetchone()
+            is not None
+        )
+
+
+def load_entries(period):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT employee_id, payload FROM entries WHERE period=?", (period,)
+        ).fetchall()
+    return {r["employee_id"]: json.loads(r["payload"]) for r in rows}
+
+
+def save_entries(period, data):
+    with db() as conn:
+        for emp_id, payload in data.items():
+            conn.execute(
+                "INSERT INTO entries (period, employee_id, payload, updated_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(period, employee_id) "
+                "DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+                (
+                    period,
+                    emp_id,
+                    json.dumps(payload, ensure_ascii=False),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+
+
+def load_calc(period):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM calculations WHERE period=?", (period,)
+        ).fetchall()
+    return {r["employee_id"]: json.loads(r["result"]) for r in rows}
+
+
+def save_calc(period, results):
+    with db() as conn:
+        for emp_id, res in results.items():
+            conn.execute(
+                "INSERT INTO calculations (period, employee_id, fio, role, result, snapshot_at) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(period, employee_id) DO UPDATE SET "
+                "result=excluded.result, snapshot_at=excluded.snapshot_at",
+                (
+                    period,
+                    emp_id,
+                    res.get("fio"),
+                    res.get("role"),
+                    json.dumps(res, ensure_ascii=False),
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+
+
+def period_label(p):
+    months = [
+        "январь", "февраль", "март", "апрель", "май", "июнь",
+        "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+    ]
+    try:
+        y, m = p.split("-")
+        return f"{months[int(m) - 1]} {y}"
+    except Exception:
+        return p
+
+
+def period_select(key):
+    now = datetime.now()
+    years = ["2025", "2026", "2027", "2028"]
+    c1, c2 = st.columns(2)
+    y = c1.selectbox("Год", years, index=years.index(str(now.year)) if str(now.year) in years else 1, key=f"y_{key}")
+    m = c2.selectbox(
+        "Месяц",
+        list(range(1, 13)),
+        index=now.month - 1,
+        format_func=lambda x: ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль",
+                               "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"][x - 1],
+        key=f"m_{key}",
     )
-    submit_emp = st.form_submit_button("Добавить")
+    return f"{y}-{m:02d}"
 
-    if submit_emp and new_fio:
-      conn = sqlite3.connect(DB_NAME)
-      cursor = conn.cursor()
-      cursor.execute(
-          "INSERT INTO employees (fio, role, status) VALUES (?, ?, 'Активен')",
-          (new_fio, new_role),
-      )
-      conn.commit()
-      conn.close()
-      st.success(f"Сотрудник {new_fio} успешно добавлен!")
-      st.rerun()
 
-  st.subheader("Список сотрудников")
-  if not df_emp.empty:
-    # Редактирование статуса
-    for index, row in df_emp.iterrows():
-      col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
-      col1.text(row["fio"])
-      col2.text(row["role"])
+# ---------------------------------------------------------------- ВХОД
+if "auth" not in st.session_state:
+    st.session_state.auth = False
 
-      new_status = col3.selectbox(
-          "Статус",
-          ["Активен", "Уволен"],
-          index=0 if row["status"] == "Активен" else 1,
-          key=f"status_{row['id']}",
-      )
-      if new_status != row["status"]:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE employees SET status = ? WHERE id = ?",
-            (new_status, row["id"]),
-        )
-        conn.commit()
-        conn.close()
-        st.success("Статус обновлен!")
-        st.rerun()
-
-      if col4.button("Удалить", key=f"del_{row['id']}"):
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM employees WHERE id = ?", (row["id"],))
-        conn.commit()
-        conn.close()
-        st.rerun()
-  else:
-    st.info("Список сотрудников пуст.")
-
-# ----------------------------------------------------
-# 2. НАСТРОЙКИ МОТИВАЦИИ
-# ----------------------------------------------------
-elif menu == "⚙️ Настройки мотивации":
-  st.header("⚙️ Настройки коэффициентов и окладов по периодам")
-  st.markdown(
-      "Здесь вы можете задавать базовые оклады, премии и коэффициенты, которые"
-      " действуют с определенного месяца и года."
-  )
-
-  conn = sqlite3.connect(DB_NAME)
-  settings_df = pd.read_sql("SELECT * FROM motivation_settings", conn)
-  conn.close()
-
-  with st.form("settings_form"):
-    col1, col2, col3, col4 = st.columns(4)
-    s_role = col1.selectbox(
-        "Роль",
-        [
-            "Операционный директор",
-            "Андеррайтер",
-            "Старший андеррайтер",
-            "Региональный представитель",
-            "Менеджер по продажам (МОП)",
-            "Коммерческий директор",
-        ],
-    )
-    s_period = col2.text_input("Период начала действия (ГГГГ-ММ)", "2026-01")
-    s_param = col3.text_input(
-        "Название параметра (например, Базовый оклад)"
-    )
-    s_val = col4.number_input("Значение", value=0.0, step=100.0)
-
-    submit_setting = st.form_submit_button("Сохранить настройку")
-    if submit_setting and s_param:
-      conn = sqlite3.connect(DB_NAME)
-      cursor = conn.cursor()
-      cursor.execute(
-          "INSERT INTO motivation_settings (role, start_period, param_name,"
-          " param_value) VALUES (?, ?, ?, ?)",
-          (s_role, s_period, s_param, s_val),
-      )
-      conn.commit()
-      conn.close()
-      st.success("Настройка сохранена!")
-      st.rerun()
-
-  st.subheader("Текущие настройки в базе")
-  if not settings_df.empty:
-    st.dataframe(settings_df, use_container_width=True)
-  else:
-    st.info("Настроек пока нет.")
-
-# ----------------------------------------------------
-# 3. РАСЧЕТ ЗАРПЛАТЫ
-# ----------------------------------------------------
-elif menu == "🧮 Расчет зарплаты":
-  st.header("🧮 Калькулятор расчета зарплаты за месяц")
-
-  # Выбор периода
-  col_p1, col_p2 = st.columns(2)
-  calc_period = col_p1.text_input(
-      "Расчетный период (ГГГГ-ММ)", datetime.now().strftime("%Y-%m")
-  )
-
-  # Проверка, закрыт ли период
-  conn = sqlite3.connect(DB_NAME)
-  cursor = conn.cursor()
-  cursor.execute(
-      "SELECT 1 FROM closed_periods WHERE period = ?", (calc_period,)
-  )
-  is_closed = cursor.fetchone() is not None
-  conn.close()
-
-  if is_closed:
-    st.warning(
-        f"🔒 Период {calc_period} **ЗАКРЫТ**. Изменение расчетов заблокировано."
-    )
-
-  # Выбор сотрудника
-  conn = sqlite3.connect(DB_NAME)
-  employees_df = pd.read_sql(
-      "SELECT * FROM employees WHERE status = 'Активен'", conn
-  )
-  conn.close()
-
-  if employees_df.empty:
-    st.warning("Сначала добавьте активных сотрудников в разделе «Сотрудники».")
-  else:
-    emp_dict = {
-        f"{row['fio']} ({row['role']})": row
-        for index, row in employees_df.iterrows()
-    }
-    selected_emp_str = st.selectbox(
-        "Выберите сотрудника для расчета", list(emp_dict.keys())
-    )
-    emp = emp_dict[selected_emp_str]
-
-    st.info(f"Роль сотрудника: **{emp['role']}**")
-
-    # Формы расчета в зависимости от роли
-    role = emp["role"]
-    base_salary = 0.0
-    discipline_penalty = 0.0
-    bonus = 0.0
-    additional_pay = 0.0
-    details = ""
-
-    with st.form("calc_form"):
-      st.subheader("Ввод параметров за месяц")
-
-      if role == "Операционный директор":
-        base_salary = st.number_input("Базовый оклад + дисциплинарная", value=100000.0)
-        penalties_sum = st.number_input(
-            "Сумма штрафов по дисциплине", value=0.0, step=1000.0
-        )
-        base_prem = st.number_input("Базовая премия (по портфелю)", value=40000.0)
-        k1 = st.slider("К1 (Желтая зона)", 0.5, 1.5, 1.2, 0.1)
-        k2 = st.slider("К2 (Красная зона)", 0.5, 1.2, 1.1, 0.1)
-        k3 = st.slider("К3 (Качество работы / SLA)", 0.5, 1.2, 1.2, 0.1)
-        k4 = st.slider("К4 (Черная зона / потери)", 0.0, 1.0, 1.0, 0.1)
-
-        discipline_penalty = penalties_sum
-        bonus = base_prem * k1 * k2 * k3 * k4
-        total_payout = (base_salary - discipline_penalty) + bonus
-        details = (
-            f"База: {base_salary}, Штрафы: {penalties_sum}, Баз. премия:"
-            f" {base_prem}, К1:{k1}, К2:{k2}, К3:{k3}, К4:{k4}"
-        )
-
-      elif role in ["Андеррайтер", "Старший андеррайтер"]:
-        def_base = 60000.0 if role == "Андеррайтер" else 65000.0
-        base_salary = st.number_input("Оклад (база + дисциплина)", value=def_base)
-        penalties_sum = st.number_input("Штрафы по дисциплине/SLA", value=0.0)
-        base_prem = st.number_input("Базовая премия", value=35000.0)
-        k1 = st.slider("К1 (Желтая зона)", 0.5, 1.5, 1.2, 0.1)
-        k2 = st.slider("К2 (Красная зона)", 0.5, 1.2, 1.1, 0.1)
-        k3 = st.slider("К3 (Объем портфеля)", 0.8, 1.3, 1.0, 0.05)
-        k4 = st.slider("К4 (Передача в СБ)", 0.5, 1.0, 1.0, 0.1)
-
-        duty_pay = 0.0
-        if role == "Старший андеррайтер":
-          duty_pay = st.number_input("Надбавка за дежурство * К5", value=15000.0)
-
-        discipline_penalty = penalties_sum
-        bonus = base_prem * k1 * k2 * k3 * k4
-        additional_pay = duty_pay
-        total_payout = (base_salary - discipline_penalty) + bonus + additional_pay
-        details = (
-            f"Оклад: {base_salary}, Штрафы: {penalties_sum}, Премия:"
-            f" {base_prem}*К1..К4, Дежурство: {duty_pay}"
-        )
-
-      elif role == "Региональный представитель":
-        base_salary = st.number_input("Оклад (база + дисциплина)", value=70000.0)
-        penalties_sum = st.number_input("Штрафы по нарушениям", value=0.0)
-        trips = st.number_input("Количество выездов", value=10, step=1)
-        trip_rate = 2500.0
-        compensations = st.number_input(
-            "Компенсации (ГСМ, амортизация, мойка, брендирование)", value=10000.0
-        )
-
-        discipline_penalty = penalties_sum
-        bonus = trips * trip_rate
-        additional_pay = compensations
-        total_payout = (base_salary - discipline_penalty) + bonus + additional_pay
-        details = (
-            f"Оклад: {base_salary}, Штрафы: {penalties_sum}, Выездов:"
-            f" {trips}*2500, Компенсации: {compensations}"
-        )
-
-      elif role == "Менеджер по продажам (МОП)":
-        base_salary = st.number_input("Оклад + дисциплинарный бонус", value=50000.0)
-        penalties_sum = st.number_input("Дисциплинарные удержания", value=0.0)
-        fin_volume = st.number_input(
-            "Объем лизингового финансирования (факт)", value=5000000.0, step=100000.0
-        )
-        fin_percent = st.number_input(
-            "Процент от объема финансирования (%)", value=0.7, step=0.05
-        )
-        k1 = st.slider("К1 (Конверсия)", 0.7, 1.2, 1.0, 0.05)
-        k2 = st.slider("К2 (Командный коэффициент)", 0.8, 1.1, 1.0, 0.05)
-        k3 = st.slider("К3 (Командный план %)", 0.8, 1.1, 1.0, 0.05)
-        k4 = st.slider("К4 (Ставка договора)", 0.7, 1.15, 1.0, 0.05)
-        k5 = st.slider("К5 (Отзывы Авито/другие)", 0.9, 1.0, 1.0, 0.05)
-
-        discipline_penalty = penalties_sum
-        base_bonus = fin_volume * (fin_percent / 100.0)
-        bonus = base_bonus * k1 * k2 * k3 * k4 * k5
-        total_payout = (base_salary - discipline_penalty) + bonus
-        details = (
-            f"Объем: {fin_volume}, %:{fin_percent}, К1..К5 учтены, Баз.бонус:"
-            f" {base_bonus}"
-        )
-
-      elif role == "Коммерческий директор":
-        base_salary = st.number_input("Оклад фиксированный", value=100000.0)
-        dept_volume = st.number_input(
-            "Объем финансирования департамента",
-            value=30000000.0,
-            step=500000.0,
-        )
-        dept_percent = st.number_input(
-            "Процент от объема департамента (%)", value=0.5, step=0.05
-        )
-        k1 = st.slider("К1 (Конверсия департамента)", 0.7, 1.2, 1.0, 0.05)
-        k2 = st.slider("К2 (Средняя ставка)", 0.8, 1.2, 1.0, 0.05)
-        k3 = st.slider("К3 (CAC - стоимость привлечения)", 0.7, 1.2, 1.0, 0.05)
-        k4 = st.slider("К4 (Качество / отзывы)", 0.0, 1.0, 1.0, 0.1)
-
-        base_bonus = dept_volume * (dept_percent / 100.0)
-        bonus = base_bonus * k1 * k2 * k3 * k4
-        total_payout = base_salary + bonus
-        details = (
-            f"Деп.объем: {dept_volume}, %:{dept_percent}, К1..К4 учтены"
-        )
-
-      st.markdown(f"### 💰 Предварительный итог к выплате: **{total_payout:,.2f} ₽**")
-
-      submit_calc = st.form_submit_button(
-          "Сохранить расчет в базу", disabled=is_closed
-      )
-
-      if submit_calc:
-        if is_closed:
-          st.error("Период закрыт, сохранение невозможно!")
+if not st.session_state.auth:
+    st.title("💼 Система мотивации")
+    st.caption("Доступ только для руководителя")
+    with st.form("login"):
+        pw = st.text_input("Пароль", type="password")
+        ok = st.form_submit_button("Войти", type="primary")
+    if ok:
+        if pw == ADMIN_PASSWORD:
+            st.session_state.auth = True
+            st.rerun()
         else:
-          conn = sqlite3.connect(DB_NAME)
-          cursor = conn.cursor()
-          cursor.execute(
-              """
-                        INSERT INTO calculations (period, employee_id, fio, role, base_salary, discipline_penalty, bonus, additional_pay, total_payout, details)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-              (
-                  calc_period,
-                  emp["id"],
-                  emp["fio"],
-                  emp["role"],
-                  base_salary,
-                  discipline_penalty,
-                  bonus,
-                  additional_pay,
-                  total_payout,
-                  details,
-              ),
-          )
-          conn.commit()
-          conn.close()
-          st.success(
-              f"Расчет для {emp['fio']} за {calc_period} успешно сохранен!"
-          )
+            st.error("Неверный пароль")
+    st.stop()
 
-# ----------------------------------------------------
-# 4. ИТОГИ И ЗАКРЫТИЕ ПЕРИОДА
-# ----------------------------------------------------
-elif menu == "📊 Итоги и закрытие периода":
-  st.header("📊 Сводная таблица итогов и закрытие периода")
 
-  report_period = st.text_input(
-      "Выберите период для отчета (ГГГГ-ММ)", datetime.now().strftime("%Y-%m")
-  )
+st.sidebar.title("💼 Мотивация")
+menu = st.sidebar.radio(
+    "Раздел",
+    ["📝 Ввод данных", "📊 Лист расчёта", "⚙️ Настройки мотивации", "👥 Сотрудники", "🗄 Архив"],
+)
+if st.sidebar.button("Выйти"):
+    st.session_state.auth = False
+    st.rerun()
 
-  conn = sqlite3.connect(DB_NAME)
-  df_calc = pd.read_sql(
-      "SELECT * FROM calculations WHERE period = ?",
-      conn,
-      params=(report_period,),
-  )
+# ================================================================ ВВОД
+if menu == "📝 Ввод данных":
+    st.header("📝 Ввод данных за месяц")
+    st.caption(
+        "Заполните фактические показатели. Жёлтые столбцы — сотрудники, строки — показатели. "
+        "Коэффициенты и суммы посчитаются на листе расчёта."
+    )
+    period = period_select("entry")
+    st.info(f"Период: **{period_label(period)}**")
 
-  cursor = conn.cursor()
-  cursor.execute(
-      "SELECT 1 FROM closed_periods WHERE period = ?", (report_period,)
-  )
-  is_closed = cursor.fetchone() is not None
-  conn.close()
+    if is_closed(period):
+        st.error("🔒 Период закрыт. Изменение данных заблокировано.")
+        st.stop()
 
-  if not df_calc.empty:
-    st.subheader(f"Итоги расчетов за {report_period}")
-    st.dataframe(df_calc, use_container_width=True)
+    emps = employees(active_only=True)
+    if not emps:
+        st.warning("Нет активных сотрудников. Добавьте их в разделе «Сотрудники».")
+        st.stop()
 
-    # Экспорт в Excel
-    from io import BytesIO
+    stored = load_entries(period)
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-      df_calc.to_excel(writer, index=False, sheet_name="Расчеты")
-    processed_data = output.getvalue()
+    for role in ROLES:
+        role_emps = [e for e in emps if e["role"] == role]
+        if not role_emps:
+            continue
+        rules = load_rules(role, period)
+        with st.expander(f"{role} — {len(role_emps)} чел.", expanded=(role == "Андеррайтер")):
+            rows, labels = [], []
+            for inp in rules["inputs"]:
+                labels.append(f"{inp['label']}, {inp['unit']}")
+                rows.append([
+                    float(stored.get(e["id"], {}).get(inp["key"], inp["default"]))
+                    for e in role_emps
+                ])
+            for pen in rules.get("penalties", []):
+                labels.append(f"⚠️ {pen['label']}, шт")
+                rows.append([
+                    float(stored.get(e["id"], {}).get(f"pen_{pen['key']}", 0))
+                    for e in role_emps
+                ])
 
+            df = pd.DataFrame(rows, index=labels, columns=[e["fio"] for e in role_emps])
+            edited = st.data_editor(
+                df,
+                use_container_width=True,
+                key=f"editor_{period}_{role}",
+                num_rows="fixed",
+            )
+
+            if st.button(f"💾 Сохранить данные: {role}", key=f"save_{role}"):
+                payload = {}
+                for i, e in enumerate(role_emps):
+                    d = {}
+                    idx = 0
+                    for inp in rules["inputs"]:
+                        d[inp["key"]] = float(edited.iloc[idx, i] or 0)
+                        idx += 1
+                    for pen in rules.get("penalties", []):
+                        d[f"pen_{pen['key']}"] = float(edited.iloc[idx, i] or 0)
+                        idx += 1
+                    payload[e["id"]] = d
+                save_entries(period, payload)
+                st.success(f"Данные сохранены за {period_label(period)}")
+                st.rerun()
+
+# ============================================================ РАСЧЁТ
+elif menu == "📊 Лист расчёта":
+    st.header("📊 Лист расчёта зарплаты")
+    period = period_select("calc")
+    closed = is_closed(period)
+    st.info(f"Период: **{period_label(period)}**" + ("  ·  🔒 закрыт" if closed else ""))
+
+    emps = employees(active_only=True)
+    entries = load_entries(period)
+
+    if closed:
+        results = load_calc(period)
+        if not results:
+            st.warning("За этот период нет сохранённых расчётов.")
+            st.stop()
+    else:
+        results = {}
+        for e in emps:
+            payload = entries.get(e["id"])
+            if not payload:
+                continue
+            rules = load_rules(e["role"], period)
+            res = compute(e["role"], rules, payload)
+            res["fio"] = e["fio"]
+            res["role"] = e["role"]
+            results[e["id"]] = res
+
+    if not results:
+        st.warning("Нет введённых данных за этот период. Заполните «Ввод данных».")
+        st.stop()
+
+    # --- сводная таблица
+    table = []
+    for emp_id, r in results.items():
+        row = {
+            "Сотрудник": r.get("fio"),
+            "Роль": r.get("role"),
+            "Оклад (база)": r["base"],
+            "Дисциплинарная часть": r["disc_full"],
+            "Удержания": -r["penalties"],
+            "Дисциплинарная к выплате": r["disc_after"],
+        }
+        if r.get("plan_pct") is not None:
+            row["Выполнение плана, %"] = r["plan_pct"]
+            row["Ставка, % от объёма"] = r["pct_rate"]
+        row["База переменной части"] = r["base_variable"]
+        for k, c in r["coefficients"].items():
+            row[c["label"]] = c["value"]
+        row[r.get("var_label") or "Переменная часть"] = r["variable"]
+        row["Компенсации / доплаты"] = r["extras"]
+        row["ИТОГО К ВЫПЛАТЕ"] = r["total"]
+        table.append(row)
+
+    df_out = pd.DataFrame(table)
+    st.dataframe(
+        df_out,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Оклад (база)": st.column_config.NumberColumn(format="%.0f ₽"),
+            "Дисциплинарная часть": st.column_config.NumberColumn(format="%.0f ₽"),
+            "Удержания": st.column_config.NumberColumn(format="%.0f ₽"),
+            "Дисциплинарная к выплате": st.column_config.NumberColumn(format="%.0f ₽"),
+            "База переменной части": st.column_config.NumberColumn(format="%.0f ₽"),
+            "ИТОГО К ВЫПЛАТЕ": st.column_config.NumberColumn(format="%.0f ₽"),
+        },
+    )
+
+    total_sum = sum(r["total"] for r in results.values())
+    st.metric("Фонд оплаты труда за период", f"{total_sum:,.0f} ₽".replace(",", " "))
+
+    # --- детализация
+    with st.expander("🔍 Детализация по сотруднику"):
+        who = st.selectbox("Сотрудник", [r.get("fio") for r in results.values()])
+        emp_id = [k for k, r in results.items() if r.get("fio") == who][0]
+        r = results[emp_id]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Начисления и коэффициенты**")
+            for label, val in r["lines"]:
+                st.write(f"{label}: **{val:,.2f}**".replace(",", " "))
+        with c2:
+            st.markdown("**Удержания**")
+            if r["penalty_lines"]:
+                for label, val in r["penalty_lines"]:
+                    st.write(f"{label}: **{val:,.0f} ₽**".replace(",", " "))
+                st.write(f"Удержано (не более дисциплинарной части): **{r['penalties_capped']:,.0f} ₽**".replace(",", " "))
+            else:
+                st.write("Нет")
+            if r["zeroed"]:
+                st.error(f"Стоп-фактор: {r['zeroed']} — переменная часть обнулена")
+
+    # --- экспорт
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, sheet_name=period)
     st.download_button(
-        label="📥 Скачать сводный отчет в Excel",
-        data=processed_data,
-        file_name=f"motivation_{report_period}.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
+        "📥 Скачать в Excel",
+        buf.getvalue(),
+        f"zarplata_{period}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-  else:
-    st.info(f"За период {report_period} пока нет сохраненных расчетов.")
 
-  st.divider()
+    st.divider()
+    colA, colB = st.columns(2)
+    if not closed:
+        if colA.button("💾 Сохранить расчёт в базу", type="primary"):
+            save_calc(period, results)
+            st.success("Расчёт сохранён.")
+        if colB.button("🔒 Закрыть период"):
+            save_calc(period, results)
+            with db() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO closed_periods (period, closed_at) VALUES (?,?)",
+                    (period, datetime.now().isoformat(timespec="seconds")),
+                )
+            st.success(f"Период {period_label(period)} закрыт. Изменения заблокированы.")
+            st.rerun()
+        st.caption(
+            "Закрытие фиксирует текущие правила и цифры: даже если позже изменить "
+            "коэффициенты, расчёт за этот месяц останется прежним."
+        )
+    else:
+        st.success("Период закрыт. Данные заморожены.")
 
-  # Блок закрытия периода
-  st.subheader("🔒 Закрытие периода")
-  if is_closed:
-    st.success(
-        f"Период **{report_period}** официально закрыт. Изменения заблокированы."
+# =========================================================== НАСТРОЙКИ
+elif menu == "⚙️ Настройки мотивации":
+    st.header("⚙️ Настройки системы мотивации")
+    st.caption(
+        "Каждый параметр, коэффициент, порог и процент настраивается. "
+        "Изменения сохраняются как новая версия с датой начала действия — "
+        "прошлые месяцы пересчитываться не будут."
     )
-  else:
-    st.warning(
-        f"Внимание! После нажатия кнопки «Закрыть период {report_period}»"
-        " любые изменения и новые расчеты за этот месяц будут заблокированы навсегда."
+
+    role = st.selectbox("Роль", ROLES)
+    versions = rule_versions(role)
+    start_period = period_select("settings")
+
+    existing = [v for v in versions if v["start_period"] == start_period]
+    if existing:
+        rules = json.loads(existing[0]["rules"])
+        st.success(f"Редактируется версия от {period_label(start_period)}")
+    else:
+        base = load_rules(role, start_period)
+        rules = json.loads(json.dumps(base, ensure_ascii=False))
+        st.warning(
+            f"Версии от {period_label(start_period)} нет — будет создана новая "
+            "на основе предыдущей."
+        )
+
+    if is_closed(start_period):
+        st.error("🔒 Период закрыт, менять настройки нельзя.")
+        st.stop()
+
+    tabs = st.tabs(["💰 Оклады и параметры", "📉 Штрафы и удержания", "📐 Коэффициенты", "📈 Проценты от объёма"])
+
+    with tabs[0]:
+        for p in rules.get("params", []):
+            p["value"] = st.number_input(
+                f"{p['label']}" + (f", {p['unit']}" if p.get("unit") else ""),
+                value=float(p["value"]),
+                step=100.0 if p.get("unit") == "₽" else 0.01,
+                key=f"par_{role}_{start_period}_{p['key']}",
+            )
+
+    with tabs[1]:
+        for pen in rules.get("penalties", []):
+            pen["amount"] = st.number_input(
+                f"{pen['label']}, ₽ за случай",
+                value=float(pen["amount"]),
+                step=500.0,
+                key=f"pen_{role}_{start_period}_{pen['key']}",
+            )
+
+    with tabs[2]:
+        if not rules.get("coeffs"):
+            st.info("У этой роли нет коэффициентов.")
+        for c in rules.get("coeffs", []):
+            st.markdown(f"**{c['label']}**")
+            if "parts" in c:
+                for part in c["parts"]:
+                    st.caption(f"Вес {int(part['weight']*100)}% · показатель: {part['input']}")
+                    st.data_editor(
+                        pd.DataFrame(part["rows"]),
+                        use_container_width=True,
+                        hide_index=True,
+                        num_rows="fixed",
+                        key=f"c_{role}_{start_period}_{c['key']}_{part['input']}",
+                        column_config={
+                            "from": st.column_config.NumberColumn("от (вкл.)"),
+                            "to": st.column_config.NumberColumn("до (не вкл.)"),
+                            "value": st.column_config.NumberColumn("коэффициент"),
+                            "comment": st.column_config.TextColumn("пояснение"),
+                        },
+                        disabled=["from", "to", "value", "comment"],
+                    )
+            else:
+                st.caption(f"Показатель: {c['input']}")
+                st.data_editor(
+                    pd.DataFrame(c["rows"]),
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    key=f"c_{role}_{start_period}_{c['key']}",
+                )
+            st.divider()
+
+    with tabs[3]:
+        if not rules.get("percent_scale"):
+            st.info("У этой роли нет процента от объёма.")
+        else:
+            st.data_editor(
+                pd.DataFrame(rules["percent_scale"]),
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key=f"ps_{role}_{start_period}",
+            )
+            st.caption("«от» — включительно, «до» — не включается. Пустое «до» = без верхней границы.")
+
+    if st.button("💾 Сохранить настройки", type="primary"):
+        save_rules(role, start_period, rules)
+        st.success(f"Настройки для роли «{role}» сохранены с {period_label(start_period)}")
+        st.rerun()
+
+# =========================================================== СОТРУДНИКИ
+elif menu == "👥 Сотрудники":
+    st.header("👥 Сотрудники")
+
+    with st.form("add"):
+        c1, c2, c3 = st.columns([3, 3, 1])
+        fio = c1.text_input("ФИО")
+        role_new = c2.selectbox("Роль", ROLES)
+        if c3.form_submit_button("Добавить") and fio.strip():
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO employees (fio, role, status) VALUES (?,?, 'Активен')",
+                    (fio.strip(), role_new),
+                )
+            st.rerun()
+
+    st.subheader("Список сотрудников")
+    emps = employees()
+    for e in emps:
+        with st.expander(f"{e['fio']} — {e['role']} ({e['status']})"):
+            c1, c2, c3 = st.columns([3, 3, 2])
+            new_fio = c1.text_input("ФИО", value=e["fio"], key=f"fio_{e['id']}")
+            new_role = c2.selectbox(
+                "Роль", ROLES,
+                index=ROLES.index(e["role"]) if e["role"] in ROLES else 0,
+                key=f"role_{e['id']}",
+            )
+            new_status = c3.selectbox(
+                "Статус", ["Активен", "Уволен"],
+                index=0 if e["status"] == "Активен" else 1,
+                key=f"st_{e['id']}",
+            )
+            b1, b2 = st.columns([1, 1])
+            if b1.button("💾 Сохранить", key=f"sv_{e['id']}"):
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE employees SET fio=?, role=?, status=? WHERE id=?",
+                        (new_fio, new_role, new_status, e["id"]),
+                    )
+                st.success("Сохранено")
+                st.rerun()
+            if b2.button("🗑 Удалить", key=f"del_{e['id']}"):
+                with db() as conn:
+                    conn.execute("DELETE FROM employees WHERE id=?", (e["id"],))
+                st.rerun()
+
+# ============================================================== АРХИВ
+elif menu == "🗄 Архив":
+    st.header("🗄 Архив расчётов")
+    with db() as conn:
+        periods = [
+            r["period"]
+            for r in conn.execute(
+                "SELECT DISTINCT period FROM calculations ORDER BY period DESC"
+            )
+        ]
+        closed = {
+            r["period"] for r in conn.execute("SELECT period FROM closed_periods")
+        }
+
+    if not periods:
+        st.info("Сохранённых расчётов пока нет.")
+    for p in periods:
+        mark = "🔒" if p in closed else "📄"
+        results = load_calc(p)
+        fund = sum(r["total"] for r in results.values())
+        with st.expander(f"{mark} {period_label(p)} — {len(results)} чел. — {fund:,.0f} ₽".replace(",", " ")):
+            rows = [
+                {
+                    "Сотрудник": r.get("fio"),
+                    "Роль": r.get("role"),
+                    "Оклад (база)": r["base"],
+                    "Дисциплинарная к выплате": r["disc_after"],
+                    "Удержания": -r["penalties"],
+                    "Переменная часть": r["variable"],
+                    "Доплаты": r["extras"],
+                    "ИТОГО К ВЫПЛАТЕ": r["total"],
+                }
+                for r in results.values()
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                pd.DataFrame(rows).to_excel(writer, index=False, sheet_name=p)
+            st.download_button(
+                "📥 Excel", buf.getvalue(), f"zarplata_{p}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_{p}",
+            )
+
+    st.divider()
+    st.subheader("Резервная копия")
+    st.caption(
+        "На бесплатном хостинге файл базы может очищаться при перезапуске сервиса. "
+        "Скачивайте копию после каждого закрытия месяца."
     )
-    if st.button(f"🔒 Закрыть период {report_period}"):
-      conn = sqlite3.connect(DB_NAME)
-      cursor = conn.cursor()
-      cursor.execute(
-          "INSERT OR IGNORE INTO closed_periods (period) VALUES (?)",
-          (report_period,),
-      )
-      conn.commit()
-      conn.close()
-      st.success(f"Период {report_period} успешно закрыт!")
-      st.rerun()
+    with open(DB_PATH, "rb") as f:
+        st.download_button("💾 Скачать базу данных", f.read(), "motivation_backup.db")
