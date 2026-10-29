@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Сотрудники{% endblock %}
+{% block body %}
+<h1>Сотрудники</h1>
+<p class="sub">Виден только ваш департамент. Добавление и удаление — только для администратора.</p>
+
+<div class="card" style="padding:0;overflow:hidden">
+<table>
+  <thead><tr><th>ФИО</th><th>Должность</th><th>Ур.</th><th>Департамент</th><th class="num">Оклад</th><th></th></tr></thead>
+  <tbody>
+  {% for e in employees %}
+    <tr>
+      <td><b>{{ e.fio }}</b></td>
+      <td>{{ positions_names.get(e.position, e.position) }}</td>
+      <td class="muted">{{ e.level if e.position.startswith('mop') else '—' }}</td>
+      <td class="muted">{{ dept_names.get(e.dept, e.dept) }}</td>
+      <td class="num">{{ e.salary|num(0) }}</td>
+      <td class="num" style="white-space:nowrap">
+        <a class="btn ghost sm" href="{{ url_for('settings', position=e.position) }}">Мотивация</a>
+        {% if g.is_admin %}
+        <form method="post" action="{{ url_for('employee_delete', emp_id=e.id) }}" style="display:inline"
+              onsubmit="return confirm('Удалить {{ e.fio }}?')">
+          <button class="btn ghost sm">Удалить</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">Нет сотрудников</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+{% if g.is_admin %}
+<h2>Добавить сотрудника</h2>
+<div class="card">
+  <form method="post" class="grid g4">
+    <div><label>ФИО</label><input name="fio" required placeholder="Иванов Иван"></div>
+    <div>
+      <label>Должность</label>
+      <select name="position" id="posSel" required>
+        {% for p in positions %}
+          <option value="{{ p }}">{{ positions_names.get(p, p) }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div><label>Уровень (для МОП)</label>
+      <select name="level"><option value="1">1</option><option value="2">2</option></select>
+    </div>
+    <div style="display:flex;align-items:flex-end"><button class="btn">Добавить</button></div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}
