@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Главная{% endblock %}
+{% block body %}
+<h1>Как работать с системой</h1>
+<p class="sub">Краткая инструкция по блокам. Ниже — сотрудники вашего департамента за текущий период.</p>
+
+{% set docs = [
+  ("1. Сотрудники", "Список сотрудников вашего департамента. Добавлять и удалять может только администратор. Должность определяет формулу расчёта, у МОП есть уровень 1 и 2 — от него зависят оклад и процент от объёма."),
+  ("2. Мотивация", "Настройки порогов и коэффициентов. Открывается по кнопке «Мотивация» у сотрудника. Меняете цифру — расчёт пересчитывается сам, в формулы лезть не нужно."),
+  ("3. Расчёт ЗП", "Кнопка «Рассчитать» напротив сотрудника. Заполняете жёлтые поля факта за период, нажимаете «Сохранить расчёт» — цифры уходят в базу. Затем «Начислить ЗП» фиксирует сумму и выплату."),
+  ("4. Расчётные листки", "Раздел «Расчётные листки» — все сохранённые расчёты периода. Одна кнопка скачивает весь пакет в PDF (половина A4 горизонтально) или Excel."),
+  ("5. Периоды", "Закрытие периода фиксирует месяц: расчёты попадают в аналитику и блокируются от правок. Закрывать и открывать период может только администратор."),
+  ("6. Аналитика", "Дашборды строятся только по закрытым периодам: общий ФОТ, суммы по месяцам и отделам, средняя сумма на сотрудника по должностям.")
+] %}
+
+<div class="kpi">
+  <div><div class="k">Период</div><div class="v" style="font-size:16px">{{ period.month }}.{{ period.year }}
+    <span class="pill {{ 'closed' if period.closed else 'open' }}">{{ 'закрыт' if period.closed else 'открыт' }}</span></div></div>
+  <div><div class="k">Сотрудников</div><div class="v">{{ employees|length }}</div></div>
+  <div><div class="k">Расчётов сохранено</div><div class="v">{{ saved|length }}</div></div>
+  <div><div class="k">Ваш доступ</div><div class="v" style="font-size:15px">{{ g.role_name }}</div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Блоки системы</h2>
+  {% for t, d in docs %}
+    <div style="padding:9px 0;border-bottom:1px solid #EEF2F6">
+      <b>{{ t }}</b>
+      <div class="muted" style="margin-top:2px">{{ d }}</div>
+    </div>
+  {% endfor %}
+</div>
+
+<h2>Сотрудники за период</h2>
+<div class="card" style="padding:0;overflow:hidden">
+<table>
+  <thead>
+    <tr>
+      <th>ФИО</th><th>Должность</th><th>Департамент</th>
+      <th class="num">Начислено</th><th class="num">Выплачено</th>
+      <th>Статус</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for e in employees %}
+    {% set s = saved.get(e.id) %}
+    <tr>
+      <td><b>{{ e.fio }}</b>{% if e.position.startswith('mop') %} <span class="muted">ур. {{ e.level }}</span>{% endif %}</td>
+      <td>{{ positions_names.get(e.position, e.position) }}</td>
+      <td class="muted">{{ dept_names.get(e.dept, e.dept) }}</td>
+      <td class="num">{{ (s.total if s else 0)|num(0) }}</td>
+      <td class="num">{{ (s.paid if s else 0)|num(0) }}</td>
+      <td>
+        {% if s and s.saved %}<span class="pill saved">рассчитан</span>
+        {% else %}<span class="pill draft">не рассчитан</span>{% endif %}
+      </td>
+      <td class="num"><a class="btn sm" href="{{ url_for('payroll', emp_id=e.id) }}">Рассчитать</a></td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7" class="muted">Нет сотрудников</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
