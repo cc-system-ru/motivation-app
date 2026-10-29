@@ -17,6 +17,10 @@ from db import (current_period, ensure_period, get_db, get_period, get_settings,
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
+# Инициализация БД при импорте модуля: gunicorn импортирует app,
+# а не запускает его как __main__, поэтому вызов ниже обязателен.
+init_db()
+
 POSITIONS = calc.DEFAULTS.keys()
 
 
@@ -434,5 +438,4 @@ def inject_globals():
 
 
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5000, debug=True)
