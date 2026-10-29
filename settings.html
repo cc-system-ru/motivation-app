@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Мотивация — {{ positions_names.get(position, position) }}{% endblock %}
+{% block body %}
+<h1>Мотивация: {{ positions_names.get(position, position) }}</h1>
+<p class="sub">Меняйте жёлтые значения. Все расчёты этого сотрудника пересчитаются автоматически —
+в формулы заходить не нужно.</p>
+<a class="btn ghost sm" href="{{ url_for('employees') }}">← К сотрудникам</a>
+
+<div class="card" style="margin-top:14px">
+<form method="post" id="settingsForm">
+  <table id="tbl">
+    <thead><tr><th>Параметр</th><th>Значение</th><th>Порог «до»</th><th>Коэффициент</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="row" style="margin-top:14px">
+    <button class="btn">Сохранить мотивацию</button>
+    <button type="button" class="btn ghost" onclick="addScaleRow()">+ добавить строку шкалы</button>
+  </div>
+</form>
+</div>
+
+<h2>Общие шкалы (используются в нескольких должностях)</h2>
+<div class="card">
+  <div class="grid g2">
+  {% for k, v in common.items() %}
+    <div class="coefbox">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:5px">{{ k }}</div>
+      {% for it in v %}
+        <div class="it"><span>{{ it[0] }} – {{ it[1] }}</span><b>{{ it[2] }}</b></div>
+      {% endfor %}
+    </div>
+  {% endfor %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const DATA = {{ data|tojson }};
+const tbody = document.querySelector('#tbl tbody');
+
+function addRow(name, val, hi, coef, isScale){
+  const tr = document.createElement('tr');
+  const kind = isScale ? 'scale' : 'simple';
+  tr.dataset.kind = kind;
+  tr.innerHTML = `
+    <td>${isScale ? '' : `<b>${name}</b>`}</td>
+    <td>${isScale ? `<input class="money" data-f="lo" value="${val ?? ''}" inputmode="decimal">` : `<input class="money" data-f="value" value="${val ?? ''}" inputmode="decimal">`}</td>
+    <td>${isScale ? `<input class="money" data-f="hi" value="${hi ?? ''}" inputmode="decimal">` : ''}</td>
+    <td>${isScale ? `<input class="money" data-f="coef" value="${coef ?? ''}" inputmode="decimal">` : ''}</td>`;
+  if(isScale){
+    const td = tr.children[0];
+    td.innerHTML = `<span class="muted">шкала</span> <select data-f="key" style="width:auto;display:inline-block"></select>`;
+    const sel = td.querySelector('select');
+    Object.keys(DATA).forEach(k=>{
+      if(Array.isArray(DATA[k]) && DATA[k].length && Array.isArray(DATA[k][0])){
+        const o=document.createElement('option'); o.value=k; o.textContent=k;
+        if(k===name) o.selected=true; sel.appendChild(o);
+      }
+    });
+  }
+  tbody.appendChild(tr);
+}
+
+for(const [k,v] of Object.entries(DATA)){
+  if(Array.isArray(v) && v.length && Array.isArray(v[0])){
+    v.forEach(r=>addRow(k, r[0], r[1], r[2], true));
+  } else if(typeof v === 'number'){
+    addRow(k, v, '', '', false);
+  }
+}
+
+function addScaleRow(){ addRow(Object.keys(DATA)[0], '', '', '', true); }
+
+document.getElementById('settingsForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  const out = JSON.parse(JSON.stringify(DATA));
+  const scales = {};
+  tbody.querySelectorAll('tr').forEach(tr=>{
+    if(tr.dataset.kind === 'scale'){
+      const key = tr.querySelector('[data-f="key"]').value;
+      const lo = tr.querySelector('[data-f="lo"]').value.replace(',', '.');
+      const hi = tr.querySelector('[data-f="hi"]').value.replace(',', '.');
+      const cf = tr.querySelector('[data-f="coef"]').value.replace(',', '.');
+      if(lo === '' || cf === '') return;
+      scales[key] = scales[key] || [];
+      scales[key].push([parseFloat(lo), hi === '' ? 1e9 : parseFloat(hi), parseFloat(cf)]);
+    } else {
+      const name = tr.children[0].innerText.trim();
+      const val = tr.querySelector('[data-f="value"]').value.replace(',', '.');
+      if(val !== '') out[name] = parseFloat(val);
+    }
+  });
+  Object.assign(out, scales);
+  Object.keys(scales).forEach(k=>{
+    out[k].sort((a,b)=>a[0]-b[0]);
+  });
+  const inp = document.createElement('input');
+  inp.type='hidden'; inp.name='payload'; inp.value=JSON.stringify(out);
+  this.appendChild(inp);
+  this.submit();
+});
+</script>
+{% endblock %}

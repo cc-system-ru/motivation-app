@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}{{ emp.fio }}{% endblock %}
+{% block body %}
+{% set pos_name = positions_names.get(emp.position, emp.position) %}
+<h1>{{ emp.fio }}
+  {% if emp.position.startswith('mop') %}<span class="muted" style="font-size:14px">· уровень {{ emp.level }}</span>{% endif %}
+</h1>
+<p class="sub">{{ pos_name }} · {{ dept_names.get(emp.dept, emp.dept) }} · период {{ period.month }}.{{ period.year }}
+  {% if period.closed %}<span class="pill closed">закрыт</span>{% endif %}
+</p>
+
+<div class="row" style="margin-bottom:14px">
+  <a class="btn ghost sm" href="{{ url_for('settings', position=emp.position) }}">Мотивация: {{ pos_name }}</a>
+  <a class="btn ghost sm" href="{{ url_for('index') }}">← К списку</a>
+</div>
+
+{% if period.closed %}
+  <div class="flash error">Период закрыт — правки доступны только администратору.</div>
+{% endif %}
+
+<form method="post" id="calcForm">
+<div class="card">
+  <h2 style="margin-top:0">Факт за период</h2>
+  <p class="sub" style="margin-bottom:12px">Десятые можно вводить и через запятую, и через точку. Проценты — числом: 22 или 22,5 для 22,5%.</p>
+  <div class="grid g3">
+    {% for key, label, kind in fields %}
+      {% set val = inputs.get(key, '') %}
+      <div>
+        <label>{{ label }}{% if kind == 'pct' %} <span class="muted">(%)</span>{% endif %}</label>
+        <input name="{{ key }}" value="{{ val }}" inputmode="decimal"
+               class="{{ 'money' if kind != 'num' }}" data-kind="{{ kind }}"
+               placeholder="0">
+      </div>
+    {% endfor %}
+  </div>
+  <div class="row" style="margin-top:16px">
+    <button class="btn" name="action" value="save">Сохранить расчёт в базу</button>
+    {% if saved %}<span class="pill saved">сохранено {{ saved.updated_at }}</span>{% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Расчёт</h2>
+  <div class="grid g2" style="align-items:start">
+    <div>
+      <table>
+        <thead><tr><th>Составляющая</th><th class="num">Сумма</th></tr></thead>
+        <tbody>
+        {% for c in result.components %}
+          <tr>
+            <td>{{ c.name }}{% if c.note %}<div class="muted">{{ c.note }}</div>{% endif %}</td>
+            <td class="num">{{ c.value|num(0) }}</td>
+          </tr>
+        {% endfor %}
+          <tr class="total">
+            <td>ИТОГО НАЧИСЛЕНО</td>
+            <td class="num">{{ result.total|num(0) }} ₽</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <div class="coefbox">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Коэффициенты и показатели</div>
+        {% for k, v in result.coefficients.items() %}
+          <div class="it">
+            <span>{{ k }}</span>
+            <b>{% if 'Выполнение' in k or 'Откл' in k %}{{ (v*100)|num(1) }}%{% else %}{{ v|num(2) }}{% endif %}</b>
+          </div>
+        {% endfor %}
+        {% if not result.coefficients %}<div class="muted">Нет коэффициентов</div>{% endif %}
+      </div>
+      <div class="card" style="margin-top:12px;background:#F9FBFD">
+        <label>Выплачено авансом / удержания, ₽</label>
+        <input class="money" name="paid" value="{{ (saved.paid if saved else 0)|num(0) }}" inputmode="decimal">
+        <div class="row" style="margin-top:10px">
+          <button class="btn" name="action" value="pay">Начислить ЗП</button>
+          <span class="muted">к получению: <b>{{ ((result.total or 0) - (saved.paid if saved else 0))|num(0) }}</b></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</form>
+
+{% if settings %}
+<h2>Действующие пороги по должности</h2>
+<div class="card">
+  <div class="grid g2">
+  {% for k, v in settings.items() %}
+    {% if v is iterable and v is not string and v is not number %}
+      <div class="coefbox">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:5px">{{ k }}</div>
+        {% for it in v %}
+          <div class="it"><span>{{ it[0] }} – {{ it[1] }}</span><b>{{ it[2] }}</b></div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endfor %}
+  </div>
+</div>
+{% endif %}
+{% endblock %}
