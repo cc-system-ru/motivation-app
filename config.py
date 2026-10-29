@@ -1,8 +1,27 @@
 import os
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "..", "data"))
-os.makedirs(DATA_DIR, exist_ok=True)
+def _pick_data_dir():
+    """Каталог для SQLite. Если заданный путь недоступен на запись
+    (например, диск не смонтирован), откатываемся на локальную папку,
+    чтобы приложение поднялось, а не падало с 500."""
+    candidates = [os.environ.get("DATA_DIR"), os.path.join(BASE_DIR, "data")]
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".write_test")
+            with open(probe, "w") as fh:
+                fh.write("ok")
+            os.remove(probe)
+            return path
+        except OSError:
+            continue
+    return os.path.join(BASE_DIR, "data")
+
+
+DATA_DIR = _pick_data_dir()
 
 DB_PATH = os.path.join(DATA_DIR, "motivation.db")
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-production-9f3a")
