@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Расчётные листки{% endblock %}
+{% block body %}
+<h1>Расчётные листки</h1>
+<p class="sub">Период {{ period.month }}.{{ period.year }}. В выгрузку попадают только сохранённые расчёты вашего департамента.</p>
+
+<div class="row" style="margin-bottom:14px">
+  <a class="btn" href="{{ url_for('payslips_pdf') }}">Скачать все PDF</a>
+  <a class="btn ghost" href="{{ url_for('payslips_xlsx') }}">Скачать Excel</a>
+  <span class="muted">PDF — по одному листку на половине A4 горизонтально</span>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+<table>
+  <thead><tr><th>ФИО</th><th>Должность</th><th>Департамент</th>
+    <th class="num">Начислено</th><th class="num">Выплачено</th><th class="num">К получению</th><th></th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><b>{{ r.fio }}</b></td>
+      <td>{{ positions_names.get(r.position, r.position) }}</td>
+      <td class="muted">{{ dept_names.get(r.dept, r.dept) }}</td>
+      <td class="num">{{ (r.total or 0)|num(0) }}</td>
+      <td class="num">{{ (r.paid or 0)|num(0) }}</td>
+      <td class="num"><b>{{ ((r.total or 0) - (r.paid or 0))|num(0) }}</b></td>
+      <td>{% if r.saved %}<span class="pill saved">в выгрузке</span>{% else %}<span class="pill draft">не рассчитан</span>{% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7" class="muted">Нет сотрудников</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
