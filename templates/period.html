@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Периоды{% endblock %}
+{% block body %}
+<h1>Периоды</h1>
+<p class="sub">Закрытие фиксирует месяц и отправляет расчёты в аналитику. Закрывать и открывать может только администратор.</p>
+
+{% if g.is_admin %}
+<div class="card">
+  <form method="post" class="row" style="align-items:flex-end">
+    <div style="width:120px"><label>Год</label><input name="year" value="2026" inputmode="numeric"></div>
+    <div style="width:120px"><label>Месяц</label><input name="month" value="1" inputmode="numeric"></div>
+    <button class="btn" name="action" value="create">Создать / открыть</button>
+    <button class="btn ghost" name="action" value="close">Закрыть период</button>
+    <button class="btn ghost" name="action" value="open">Снять закрытие</button>
+  </form>
+</div>
+{% else %}
+<div class="flash error">Ваша роль не может закрывать или открывать периоды.</div>
+{% endif %}
+
+<div class="card" style="padding:0;overflow:hidden">
+<table>
+  <thead><tr><th>Период</th><th>Статус</th><th>Закрыт</th></tr></thead>
+  <tbody>
+  {% for p in periods %}
+    <tr>
+      <td><b>{{ p.month }}.{{ p.year }}</b></td>
+      <td><span class="pill {{ 'closed' if p.closed else 'open' }}">{{ 'закрыт' if p.closed else 'открыт' }}</span></td>
+      <td class="muted">{{ p.closed_at or '—' }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="3" class="muted">Периодов нет</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
