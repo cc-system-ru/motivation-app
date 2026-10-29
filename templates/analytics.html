@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Аналитика{% endblock %}
+{% block body %}
+<h1>Аналитика</h1>
+<p class="sub">Строится только по закрытым периодам вашего департамента.</p>
+
+<div class="kpi">
+  <div><div class="k">Общий ФОТ</div><div class="v" id="kTotal">—</div></div>
+  <div><div class="k">Месяцев в базе</div><div class="v" id="kMonths">—</div></div>
+  <div><div class="k">Отделов</div><div class="v" id="kDepts">—</div></div>
+  <div><div class="k">Должностей</div><div class="v" id="kPos">—</div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">ФОТ по месяцам и отделам</h2>
+  <div id="chartDept"></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Средняя сумма на сотрудника по должностям</h2>
+  <div id="chartPos"></div>
+</div>
+
+<p class="muted" id="empty" style="display:none">Данных пока нет — закройте период с сохранёнными расчётами.</p>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const fmt = v => new Intl.NumberFormat('ru-RU').format(Math.round(v)) + ' ₽';
+
+fetch("{{ url_for('api_analytics') }}").then(r=>r.json()).then(d=>{
+  document.getElementById('kTotal').textContent = fmt(d.total);
+  document.getElementById('kMonths').textContent = d.months.length;
+  document.getElementById('kDepts').textContent = d.depts.length;
+  document.getElementById('kPos').textContent = d.positions.length;
+
+  if(!d.months.length){ document.getElementById('empty').style.display='block'; return; }
+
+  const colors = ['#1F4E78','#2E75B6','#7FB2DC','#B9C9D9','#4B8BBE'];
+  new Chart(document.getElementById('chartDept'), {
+    type: 'bar',
+    data: {
+      labels: d.months,
+      datasets: d.depts.map((s,i)=>({
+        label: s.name, data: s.data, backgroundColor: colors[i%colors.length]
+      }))
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        y: { beginAtZero: true, ticks: { callback: v => new Intl.NumberFormat('ru-RU').format(v) } }
+      },
+      plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmt(c.parsed.y) } } }
+    }
+  });
+  document.getElementById('chartDept').style.height = '320px';
+
+  new Chart(document.getElementById('chartPos'), {
+    type: 'bar',
+    data: {
+      labels: d.positions.map(p=>p.name),
+      datasets: [{ label: 'Средняя на сотрудника', data: d.positions.map(p=>p.avg),
+                   backgroundColor: '#2E75B6' }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { tooltip: { callbacks: { label: c => fmt(c.parsed.x) } } },
+      scales: { x: { beginAtZero: true, ticks: { callback: v => new Intl.NumberFormat('ru-RU').format(v) } } }
+    }
+  });
+  document.getElementById('chartPos').style.height = Math.max(220, d.positions.length*40) + 'px';
+});
+</script>
+{% endblock %}
