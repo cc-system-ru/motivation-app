@@ -1,476 +1,337 @@
-"""
-Движок расчёта мотивации.
-Чистая логика без UI: правила (пороги, коэффициенты, оклады) описываются словарями,
-которые хранятся в БД и редактируются в интерфейсе.
-"""
+"""Расчёт мотивации. Все пороги и ставки берутся из настроек (редактируются в UI)."""
 
-from copy import deepcopy
+DEFAULTS = {
+    "kd": {
+        "salary": 100000,
+        "base_premium": 50000,
+        "plan_scale": [[0, 0.70, 0], [0.70, 0.90, 0.8], [0.90, 1.00, 1.0],
+                       [1.00, 1.10, 1.2], [1.10, 99, 1.4]],
+    },
+    "mop": {
+        "salary_l1": 35000,
+        "salary_l2": 45000,
+        "rate_l1": 0.007,
+        "rate_l2": 0.010,
+        "plan_scale": [[0, 0.70, 0], [0.70, 0.90, 0.8], [0.90, 1.00, 1.0],
+                       [1.00, 1.10, 1.2], [1.10, 99, 1.4]],
+        "k4_scale": [[0.3, 99, 1.15], [0.0, 0.3, 1.10],
+                     [-0.3, 0.0, 1.0], [-0.6, -0.3, 0.9], [-99, -0.6, 0.8]],
+    },
+    "od": {
+        "salary": 90000,
+        "disc_base": 10000,
+        "premium_base": 40000,
+        "premium_step": 4000,
+        "contract_threshold": 400,
+        "contract_step": 100,
+    },
+    "and": {
+        "salary": 45000,
+        "disc_base": 15000,
+        "premium_base": 35000,
+        "disc_limit": 15000,
+    },
+    "and_sr": {
+        "salary": 50000,
+        "disc_base": 15000,
+        "premium_base": 35000,
+        "disc_limit": 15000,
+        "duty_bonus": 15000,
+    },
+    "rep": {
+        "salary": 50000,
+        "disc_base": 20000,
+        "visit_rate": 2500,
+        "fuel_per_100": 10,
+        "fuel_price": 65,
+        "amort_rate": 2.5,
+        "wash": 2000,
+        "brand_rear": 2500,
+        "brand_side": 5000,
+    },
+    "sb": {
+        "salary": 20000,
+        "premium_base": 30000,
+        "seizure_rate": 8000,
+        "k1_scale": [[0.90, 2, 1.2], [0.70, 0.90, 1.0], [0.50, 0.70, 0.6], [0, 0.50, 0]],
+        "k2_scale": [[0, 5, 1.2], [5, 8, 1.0], [8, 12, 0.7], [12, 999, 0.5]],
+        "collect_scale": [[0, 100000, 0.05], [100000, 200000, 0.10], [200000, 10**9, 0.15]],
+    },
+    "adm": {
+        "salary": 45000,
+        "premium_base": 15000,
+        "smm_bonus": 10000,
+        "k1_scale": [[0, 0, 1.0], [1, 1, 0.8], [2, 2, 0.5], [3, 99, 0]],
+        "k2_scale": [[0, 0, 1.0], [1, 2, 0.8], [3, 99, 0]],
+    },
+}
 
-ROLES = [
-    "Операционный директор",
-    "Андеррайтер",
-    "Старший андеррайтер",
-    "Региональный представитель",
-    "Менеджер по продажам (МОП)",
-    "Коммерческий директор",
-]
+# единые шкалы для андеррайтеров и ОД
+COMMON = {
+    "k1_yellow": [[0, 0.15, 0.6], [0.15, 0.20, 0.8], [0.20, 0.25, 1.2], [0.25, 1, 1.0]],
+    "k2_red": [[0, 0.04, 1.1], [0.04, 0.07, 1.0], [0.07, 0.10, 0.8], [0.10, 1, 0.5]],
+    "k3_volume": [[0, 150, 1.0], [150, 10**9, 1.15]],
+    "k4_sb": [[0, 0.03, 1.0], [0.03, 0.045, 0.9], [0.045, 0.06, 0.8], [0.06, 1, 0.5]],
+    "stop_lost": [[0, 0.5, 1.0], [1, 1.5, 0.3], [2, 99, 0.0]],
+    "k3_quality": [[0, 0.5, 1.2], [1, 1.5, 0.9], [2, 99, 0.7]],
+    "k5_chief": [[0, 0.06, 1.0], [0.06, 0.09, 0.8], [0.09, 1, 0.5]],
+}
 
 
-def _rows(*triples):
-    """(от, до, значение, комментарий) -> список строк шкалы. до=None -> без верхней границы."""
-    out = []
-    for t in triples:
-        a, b, v = t[0], t[1], t[2]
-        note = t[3] if len(t) > 3 else ""
-        out.append({"from": a, "to": b, "value": v, "comment": note})
+def lookup(scale, value):
+    """scale: список [от, до, значение]."""
+    if value is None:
+        return 0
+    for lo, hi, val in scale:
+        if lo <= value < hi:
+            return val
+    return scale[-1][2]
+
+
+def scale_plan(value):
+    return lookup(DEFAULTS["mop"]["plan_scale"], value)
+
+
+def num(v, default=0.0):
+    if v is None or v == "":
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    return float(str(v).replace(",", ".").replace(" ", "").replace("\u00a0", ""))
+
+
+def f0(x):
+    try:
+        return f"{float(x):,.0f}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def pct(v, default=0.0):
+    """Процент из поля ввода -> доля. «22», «22,5», «0.225» -> 0.22."""
+    x = num(v, default * 100)
+    return x / 100.0
+
+
+def calc(position, level, inputs, settings=None):
+    """Возвращает dict: components, coefficients, total, notes."""
+    s = dict(DEFAULTS[position])
+    if settings:
+        s.update(settings)
+    inp = inputs or {}
+    out = {"coefficients": {}, "components": [], "total": 0.0, "notes": []}
+
+    def add(name, value, note=""):
+        out["components"].append({"name": name, "value": round(value, 2), "note": note})
+
+    if position == "kd":
+        salary = num(inp.get("salary"), s["salary"])
+        fact, plan = num(inp.get("volume_fact")), num(inp.get("plan"))
+        compl = fact / plan if plan else 0
+        k = lookup(s["plan_scale"], compl)
+        premium = s["base_premium"] * k
+        disc = num(inp.get("discipline"))
+        spec = num(inp.get("spec_bonus"))
+        out["coefficients"] = {"K план": k, "Выполнение плана": round(compl, 4)}
+        add("Оклад", salary)
+        add("Переменная часть", premium, f"база {f0(s['base_premium'])} × K {k}")
+        add("Дисциплинарная часть", -disc, "удержание")
+        add("Спецпремии", spec)
+        out["total"] = salary + premium - disc + spec
+
+    elif position == "mop":
+        lvl = int(level or 1)
+        salary = num(inp.get("salary"), s["salary_l2"] if lvl == 2 else s["salary_l1"])
+        fact, plan = num(inp.get("volume_fact")), num(inp.get("plan"))
+        compl = fact / plan if plan else 0
+        k_plan = lookup(s["plan_scale"], compl)
+        rate = s["rate_l2"] if lvl == 2 else s["rate_l1"]
+        diff = pct(inp.get("rate_fact")) * 100 - pct(inp.get("rate_plan")) * 100
+        k4 = lookup(s["k4_scale"], diff)
+        variable = fact * rate * k_plan * k4
+        disc = num(inp.get("discipline"))
+        spec = num(inp.get("spec_bonus"))
+        out["coefficients"] = {"K план": k_plan, "K4 ставка": k4,
+                               "Выполнение": round(compl, 4), "Откл. ставки": round(diff, 3)}
+        add("Оклад", salary)
+        add("Переменная часть", variable,
+            f"{fact:,.0f} × {rate*100:.2f}% × K {k_plan} × K4 {k4}")
+        add("Дисциплинарная часть", -disc, "удержание")
+        add("Спецпремии", spec)
+        out["total"] = salary + variable - disc + spec
+
+    elif position in ("and", "and_sr"):
+        sr = position == "and_sr"
+        salary = num(inp.get("salary"), s["salary"])
+        disc_base = s["disc_base"]
+        fines = [num(inp.get(f"fine{i}")) for i in range(1, 6)]
+        fine_rates = [3000, 3000, 1000, 2000, 2000]
+        disc_cut = min(s["disc_limit"], sum(n * r for n, r in zip(fines, fine_rates)))
+        k1 = lookup(COMMON["k1_yellow"], pct(inp.get("yellow")))
+        k2 = lookup(COMMON["k2_red"], pct(inp.get("red")))
+        k3 = lookup(COMMON["k3_volume"], num(inp.get("contracts")))
+        k4 = lookup(COMMON["k4_sb"], pct(inp.get("to_sb")))
+        stop = lookup(COMMON["stop_lost"], num(inp.get("lost")))
+        prod = k1 * k2 * k3 * k4 * stop
+        premium = s["premium_base"] * prod
+        coeffs = {"K1 жёлтая": k1, "K2 красная": k2, "K₃ объём": k3,
+                  "K4 СБ": k4, "Стоп-фактор": stop, "Произведение": round(prod, 4)}
+        add("Оклад база", salary)
+        add("Дисциплинарная часть", disc_base - disc_cut, f"база {f0(disc_base)} − вычеты {f0(disc_cut)}")
+        add("Переменная часть", premium, f"база {f0(s['premium_base'])} × {prod:.2f}")
+        if sr:
+            k5 = lookup(COMMON["k5_chief"], pct(inp.get("dept_red")))
+            dept_lost = num(inp.get("dept_lost"))
+            if dept_lost >= 1:
+                k5 = 0
+            duty = s["duty_bonus"] * k5
+            coeffs["K5 дежурство"] = k5
+            add("Премия старшего (дежурство)", duty, f"{f0(s['duty_bonus'])} × K5 {k5}")
+            out["total"] = salary + (disc_base - disc_cut) + premium + duty
+        else:
+            out["total"] = salary + (disc_base - disc_cut) + premium
+        out["coefficients"] = coeffs
+
+    elif position == "od":
+        salary = num(inp.get("salary"), s["salary"])
+        disc_base = s["disc_base"]
+        fines = [num(inp.get(f"fine{i}")) for i in range(1, 5)]
+        fine_rates = [2000, 3000, 2000, 3000]
+        disc_cut = min(disc_base, sum(n * r for n, r in zip(fines, fine_rates)))
+        contracts = num(inp.get("contracts"))
+        over = max(0, (contracts - s["contract_threshold"]) // s["contract_step"])
+        prem_base = s["premium_base"] + s["premium_step"] * over
+        k1 = lookup(COMMON["k1_yellow"], pct(inp.get("yellow")))
+        k2 = lookup(COMMON["k2_red"], pct(inp.get("red")))
+        k3 = lookup(COMMON["k3_quality"], num(inp.get("violations")))
+        k4 = lookup(COMMON["stop_lost"], num(inp.get("lost")))
+        prod = k1 * k2 * k3 * k4
+        premium = prem_base * prod
+        out["coefficients"] = {"K1 жёлтая": k1, "K2 красная": k2, "K3 качество": k3,
+                               "K4 потери": k4, "Произведение": round(prod, 4)}
+        add("Оклад база", salary)
+        add("Дисциплинарная часть", disc_base - disc_cut)
+        add("Базовая премия", prem_base, f"{f0(s['premium_base'])} + {over} × {f0(s['premium_step'])}")
+        add("Переменная часть", premium, f"база {prem_base} × {prod:.4f}")
+        out["total"] = salary + (disc_base - disc_cut) + premium
+
+    elif position == "rep":
+        salary = num(inp.get("salary"), s["salary"])
+        disc_base = s["disc_base"]
+        fines = [num(inp.get(f"fine{i}")) for i in range(1, 10)]
+        fine_rates = [10000, 10000, 5000, 5000, 8000, 15000, 5000, 10000, 15000]
+        disc_cut = min(disc_base, sum(n * r for n, r in zip(fines, fine_rates)))
+        visits = num(inp.get("visits"))
+        km = num(inp.get("km"))
+        visit_pay = visits * s["visit_rate"]
+        fuel = km * s["fuel_per_100"] / 100 * s["fuel_price"]
+        amort = km * s["amort_rate"]
+        wash = s["wash"] if num(inp.get("video")) >= 1 else 0
+        brand = 0
+        if num(inp.get("video")) >= 1:
+            if num(inp.get("brand_rear")) >= 1:
+                brand += s["brand_rear"]
+            if num(inp.get("brand_side")) >= 1:
+                brand += s["brand_side"]
+        out["coefficients"] = {"Выездов": visits, "Пробег": km, "Вычеты": disc_cut}
+        add("Оклад база", salary)
+        add("Дисциплинарная часть", disc_base - disc_cut, f"база {f0(disc_base)} − вычеты {f0(disc_cut)}")
+        add("Оплата выездов", visit_pay, f"{f0(visits)} × {f0(s['visit_rate'])}")
+        add("ГСМ", fuel, f"{f0(km)} км × {s['fuel_per_100']}/100 × {f0(s['fuel_price'])}")
+        add("Амортизация", amort, f"{f0(km)} км × {s['amort_rate']}")
+        add("Мойка", wash)
+        add("Брендирование", brand)
+        out["total"] = salary + (disc_base - disc_cut) + visit_pay + fuel + amort + wash + brand
+
+    elif position == "sb":
+        salary = num(inp.get("salary"), s["salary"])
+        closed, total_tasks = num(inp.get("closed")), num(inp.get("total_tasks"))
+        share = closed / total_tasks if total_tasks else 0
+        k1 = lookup(s["k1_scale"], share)
+        avg_days = num(inp.get("avg_days"), 0)
+        k2 = lookup(s["k2_scale"], avg_days)
+        premium = s["premium_base"] * k1 * k2
+        seizures = num(inp.get("seizures"))
+        seizure_pay = seizures * s["seizure_rate"]
+        collected = num(inp.get("collected"))
+        rate = lookup(s["collect_scale"], collected)
+        collect_pay = collected * rate
+        out["coefficients"] = {"K1 закрытие": k1, "K2 скорость": k2,
+                               "Доля закрытых": round(share, 4), "Ср. срок": avg_days,
+                               "Ставка взыскания": rate}
+        add("Оклад", salary)
+        add("Базовая премия", premium, f"{f0(s['premium_base'])} × K1 {k1} × K2 {k2}")
+        add("Изъятия", seizure_pay, f"{f0(seizures)} × {f0(s['seizure_rate'])}")
+        add("Взыскание", collect_pay, f"{f0(collected)} × {rate*100:.0f}%")
+        out["total"] = salary + premium + seizure_pay + collect_pay
+
+    elif position == "adm":
+        salary = num(inp.get("salary"), s["salary"])
+        k1 = lookup(s["k1_scale"], num(inp.get("errors")))
+        k2 = lookup(s["k2_scale"], num(inp.get("delays")))
+        premium = s["premium_base"] * k1 * k2
+        smm = s["smm_bonus"] if num(inp.get("smm")) >= 1 else 0
+        out["coefficients"] = {"K1 казначейство": k1, "K2 дисциплина": k2}
+        add("Оклад", salary)
+        add("Базовая премия", premium, f"{f0(s['premium_base'])} × K1 {k1} × K2 {k2}")
+        add("Бонус SMM", smm)
+        out["total"] = salary + premium + smm
+
+    out["total"] = round(out["total"], 0)
     return out
 
 
-def _p(key, label, value, unit=""):
-    return {"key": key, "label": label, "value": value, "unit": unit}
-
-
-def _pen(key, label, amount):
-    return {"key": key, "label": label, "amount": amount}
-
-
-def _inp(key, label, unit, default=0.0):
-    return {"key": key, "label": label, "unit": unit, "default": default}
-
-
-DEFAULT_RULES = {
-    # ------------------------------------------------------------------ ОД
-    "Операционный директор": {
-        "formula": "premium",
-        "params": [
-            _p("base_salary", "Базовая часть оклада", 90000, "₽"),
-            _p("disc_salary", "Дисциплинарная часть оклада", 10000, "₽"),
-            _p("base_premium", "Базовая премия", 40000, "₽"),
-            _p("premium_indexation", "Индексация премии по портфелю (1 — вкл, 0 — выкл)", 1, ""),
-            _p("sla_request_limit", "SLA: проверка заявки, не более", 2, "ч"),
-            _p("sla_auto_limit", "SLA: согласование авто, не более", 2, "ч"),
-            _p("sla_overdue_limit", "SLA: просроченных мероприятий, не более", 5, "%"),
-        ],
-        "penalties": [
-            _pen("late", "Опоздание без уважительной причины (более 15 мин)", 2000),
-            _pen("task", "Неисполнение письменного поручения собственника в срок", 3000),
-            _pen("report", "Непредоставление отчёта в срок", 2000),
-            _pen("complaint", "Подтверждённая жалоба смежного отдела", 3000),
-        ],
-        "inputs": [
-            _inp("contracts", "Активных договоров в департаменте", "шт", 450),
-            _inp("yellow_pct", "Доля жёлтой зоны", "%", 22),
-            _inp("red_pct", "Доля красной зоны", "%", 5),
-            _inp("avg_request_h", "Ср. время проверки заявки", "ч", 2),
-            _inp("avg_auto_h", "Ср. время согласования автомобиля", "ч", 2),
-            _inp("overdue_events_pct", "Просроченных мероприятий", "%", 3),
-            _inp("lost_cars", "Потерянных авто", "шт", 0),
-        ],
-        "coeffs": [
-            {"key": "k1", "label": "К₁ — жёлтая зона", "input": "yellow_pct",
-             "rows": _rows((None, 15, 0.6), (15, 20, 0.8), (20, 25, 1.2), (25, None, 1.0))},
-            {"key": "k2", "label": "К₂ — красная зона", "input": "red_pct",
-             "rows": _rows((None, 4, 1.1), (4, 7, 1.0), (7, 10, 0.8), (10, None, 0.5))},
-            {"key": "k3", "label": "К₃ — качество работы (SLA)", "input": "__sla_violations",
-             "rows": _rows((0, 1, 1.2), (1, 2, 0.9), (2, None, 0.7))},
-            {"key": "k4", "label": "К₄ — потерянные авто", "input": "lost_cars",
-             "rows": _rows((0, 1, 1.0), (1, 2, 0.3), (2, None, 0.0))},
-        ],
-        "zero_if": [],
-        "percent_scale": [],
-    },
-    # -------------------------------------------------------- Андеррайтер
-    "Андеррайтер": {
-        "formula": "premium",
-        "params": [
-            _p("base_salary", "Базовая часть оклада", 45000, "₽"),
-            _p("disc_salary", "Дисциплинарная часть оклада", 15000, "₽"),
-            _p("base_premium", "Базовая премия", 35000, "₽"),
-        ],
-        "penalties": [
-            _pen("req_time", "Проверка заявки клиента > 2 часов", 3000),
-            _pen("auto_time", "Согласование автомобиля > 2 часов", 3000),
-            _pen("crm", "Неполное заполнение карточки в CRM", 1000),
-            _pen("ppk", "Пропуск контрольной точки постзапускного контроля (ПТС, ключи, ОСАГО)", 2000),
-            _pen("problem", "Договор в проблемном листе без мероприятий / просрочены мероприятия", 2000),
-        ],
-        "inputs": [
-            _inp("yellow_pct", "Доля жёлтой зоны", "%", 22),
-            _inp("red_pct", "Доля красной зоны", "%", 5),
-            _inp("contracts", "Активных договоров в портфеле", "шт", 150),
-            _inp("sb_share_pct", "Доля договоров, переданных в СБ", "%", 2),
-            _inp("lost_cars", "Потерянных авто", "шт", 0),
-        ],
-        "coeffs": [
-            {"key": "k1", "label": "К₁ — жёлтая зона", "input": "yellow_pct",
-             "rows": _rows((None, 15, 0.6), (15, 20, 0.8), (20, 25, 1.2), (25, None, 1.0))},
-            {"key": "k2", "label": "К₂ — красная зона", "input": "red_pct",
-             "rows": _rows((None, 4, 1.1), (4, 7, 1.0), (7, 10, 0.8), (10, None, 0.5))},
-            {"key": "k3", "label": "К₃ — объём портфеля", "input": "contracts",
-             "rows": _rows((None, 150, 1.0), (150, 170, 1.15), (170, None, 1.15))},
-            {"key": "k4", "label": "К₄ — передача в СБ", "input": "sb_share_pct",
-             "rows": _rows((None, 3, 1.0), (3, 4.5, 0.9), (4.5, 6, 0.8), (6, None, 0.5))},
-        ],
-        "zero_if": [{"input": "lost_cars", "threshold": 1,
-                     "label": "Есть потерянное авто"}],
-        "percent_scale": [],
-    },
-    # ----------------------------------------------- Старший андеррайтер
-    "Старший андеррайтер": {
-        "formula": "premium_duty",
-        "params": [
-            _p("base_salary", "Базовая часть оклада", 50000, "₽"),
-            _p("disc_salary", "Дисциплинарная часть оклада", 15000, "₽"),
-            _p("base_premium", "Базовая премия (личный портфель)", 35000, "₽"),
-            _p("duty_allowance", "Надбавка за дежурство", 15000, "₽"),
-        ],
-        "penalties": [
-            _pen("req_time", "Проверка заявки клиента > 2 часов", 3000),
-            _pen("auto_time", "Согласование автомобиля > 2 часов", 3000),
-            _pen("crm", "Неполное заполнение карточки в CRM", 1000),
-            _pen("ppk", "Пропуск контрольной точки постзапускного контроля (ПТС, ключи, ОСАГО)", 2000),
-            _pen("problem", "Договор в проблемном листе без мероприятий / просрочены мероприятия", 2000),
-        ],
-        "inputs": [
-            _inp("yellow_pct", "Доля жёлтой зоны (личный портфель)", "%", 22),
-            _inp("red_pct", "Доля красной зоны (личный портфель)", "%", 5),
-            _inp("contracts", "Активных договоров в портфеле", "шт", 160),
-            _inp("sb_share_pct", "Доля договоров, переданных в СБ", "%", 2),
-            _inp("lost_cars", "Потерянных авто (лично)", "шт", 0),
-            _inp("dept_red_pct", "Красная зона по отделу", "%", 5),
-            _inp("dept_lost_cars", "Потерянных авто по отделу", "шт", 0),
-        ],
-        "coeffs": [
-            {"key": "k1", "label": "К₁ — жёлтая зона", "input": "yellow_pct",
-             "rows": _rows((None, 15, 0.6), (15, 20, 0.8), (20, 25, 1.2), (25, None, 1.0))},
-            {"key": "k2", "label": "К₂ — красная зона", "input": "red_pct",
-             "rows": _rows((None, 4, 1.1), (4, 7, 1.0), (7, 10, 0.8), (10, None, 0.5))},
-            {"key": "k3", "label": "К₃ — объём портфеля", "input": "contracts",
-             "rows": _rows((None, 150, 1.0), (150, 170, 1.15), (170, None, 1.15))},
-            {"key": "k4", "label": "К₄ — передача в СБ", "input": "sb_share_pct",
-             "rows": _rows((None, 3, 1.0), (3, 4.5, 0.9), (4.5, 6, 0.8), (6, None, 0.5))},
-            {"key": "k5", "label": "К₅ — командный (отдел)", "input": "dept_red_pct",
-             "rows": _rows((None, 7, 1.0), (7, 9, 0.8), (9, None, 0.5))},
-        ],
-        "zero_if": [{"input": "lost_cars", "threshold": 1,
-                     "label": "Есть потерянное авто"}],
-        "percent_scale": [],
-        "duty_zero_if": [{"input": "dept_lost_cars", "threshold": 1,
-                          "label": "Есть потерянное авто по отделу"}],
-    },
-    # ------------------------------------------ Региональный представитель
-    "Региональный представитель": {
-        "formula": "trip",
-        "params": [
-            _p("base_salary", "Базовая часть оклада", 50000, "₽"),
-            _p("disc_salary", "Дисциплинарная часть оклада", 20000, "₽"),
-            _p("trip_rate", "Оплата за выезд", 2500, "₽"),
-            _p("fuel_per_100", "Расход топлива на 100 км", 10, "л"),
-            _p("fuel_price", "Цена топлива (АИ-95)", 65, "₽/л"),
-            _p("amort_rate", "Амортизация за км", 2.5, "₽/км"),
-            _p("wash", "Мойка (за месяц при видеоотчёте)", 2000, "₽"),
-            _p("brand_back", "Брендирование — заднее стекло", 2500, "₽"),
-            _p("brand_side", "Брендирование — бока", 5000, "₽"),
-        ],
-        "penalties": [
-            _pen("refuse", "Отказ от выезда без уважительной причины", 10000),
-            _pen("late", "Опоздание на сделку более чем на 1 час", 10000),
-            _pen("report_late", "Несвоевременная загрузка фото/видео отчёта (>24 ч)", 5000),
-            _pen("docs_late", "Несвоевременная отправка оригиналов документов", 5000),
-            _pen("docs_missing", "Отсутствие документа в пакете сделки (частичное)", 8000),
-            _pen("docs_none", "Полное отсутствие документов в пакете сделки", 15000),
-            _pen("client_complaint", "Жалоба клиента на представителя", 5000),
-            _pen("beacon_found", "Обнаружение маяка клиентом", 10000),
-            _pen("beacon_missing", "Не установлен маяк на авто при выезде на сделку", 15000),
-        ],
-        "inputs": [
-            _inp("trips", "Количество выездов", "шт", 10),
-            _inp("km", "Пробег за месяц", "км", 1500),
-            _inp("fuel_price", "Цена топлива за месяц", "₽/л", 65),
-            _inp("wash", "Мойка (1 — да, 0 — нет)", "0/1", 1),
-            _inp("brand_back", "Брендирование: заднее стекло (0/1)", "0/1", 1),
-            _inp("brand_side", "Брендирование: бока (0/1)", "0/1", 0),
-        ],
-        "coeffs": [],
-        "zero_if": [],
-        "percent_scale": [],
-    },
-    # ---------------------------------------------------- МОП
-    "Менеджер по продажам (МОП)": {
-        "formula": "percent",
-        "params": [
-            _p("base_salary", "Оклад (фиксированная часть)", 35000, "₽"),
-            _p("disc_salary", "Дисциплинарный бонус", 15000, "₽"),
-        ],
-        "penalties": [
-            _pen("crm", "Нарушение CRM-дисциплины / SLA", 3000),
-            _pen("sb30", "Договор ушёл в СБ в первые 30 дней", 15000),
-        ],
-        "inputs": [
-            _inp("volume", "Объём финансирования (факт)", "₽", 7000000),
-            _inp("plan", "Личный план на месяц", "₽", 7000000),
-            _inp("conv_incoming_pct", "Конверсия входящих лидов", "%", 5),
-            _inp("conv_target_pct", "Конверсия целевых лидов", "%", 25),
-            _inp("team_plan_pct", "Выполнение плана отдела", "%", 100),
-            _inp("avg_rate_pct", "Средняя ставка по договорам", "%", 0.153),
-            _inp("reviews_share_pct", "Доля отзывов с Авито", "%", 65),
-        ],
-        "coeffs": [
-            {"key": "k1", "label": "К₁ — конверсия (взвеш.)",
-             "parts": [
-                 {"input": "conv_incoming_pct", "weight": 0.4,
-                  "rows": _rows((None, 15, 0.7), (15, 20, 0.9), (20, 25, 1.0), (25, 30, 1.1), (30, None, 1.2))},
-                 {"input": "conv_target_pct", "weight": 0.6,
-                  "rows": _rows((None, 15, 0.7), (15, 20, 0.9), (20, 25, 1.0), (25, 30, 1.1), (30, None, 1.2))},
-             ]},
-            {"key": "k2", "label": "К₂ — командный (план отдела)", "input": "team_plan_pct",
-             "rows": _rows((None, 70, 0.8), (70, 90, 0.9), (90, 100, 1.0), (100, None, 1.1))},
-            {"key": "k3", "label": "К₃ — средняя ставка", "input": "avg_rate_pct",
-             "rows": _rows((None, 0.148, 0.7), (0.148, 0.152, 0.85), (0.152, 0.156, 1.0), (0.156, None, 1.15))},
-            {"key": "k4", "label": "К₄ — отзывы (Авито и др.)", "input": "reviews_share_pct",
-             "rows": _rows((None, 60, 0.9), (60, None, 1.0))},
-        ],
-        "zero_if": [],
-        "percent_scale": _rows(
-            (None, 70, 0.0, "порог не пройден"),
-            (70, 90, 0.45, "пониженная ставка"),
-            (90, 100, 0.55, "базовая ставка"),
-            (100, 110, 0.65, "целевая ставка"),
-            (110, None, 0.70, "повышенная ставка"),
-        ),
-    },
-    # ------------------------------------------- Коммерческий директор
-    "Коммерческий директор": {
-        "formula": "percent",
-        "params": [
-            _p("base_salary", "Оклад (фиксированная часть)", 100000, "₽"),
-            _p("disc_salary", "Дисциплинарная часть (если есть)", 0, "₽"),
-        ],
-        "penalties": [],
-        "inputs": [
-            _inp("volume", "Объём финансирования департамента", "₽", 30000000),
-            _inp("plan", "План департамента", "₽", 30000000),
-            _inp("conv_pct", "Конверсия департамента (лид → договор)", "%", 17),
-            _inp("avg_rate_pct", "Средняя ставка по договорам", "%", 0.150),
-            _inp("cac", "CAC (факт), ₽ на договор", "₽", 20000),
-            _inp("plan_cac", "Плановый CAC, ₽ на договор", "₽", 20000),
-            _inp("neg_reviews", "Негативных отзывов (по существу)", "шт", 0),
-            _inp("spetz", "Спецпремии за месяц", "₽", 0),
-        ],
-        "coeffs": [
-            {"key": "k1", "label": "К₁ — конверсия департамента", "input": "conv_pct",
-             "rows": _rows((None, 10, 0.7), (10, 15, 0.85), (15, 20, 1.0), (20, 25, 1.1), (25, None, 1.2))},
-            {"key": "k2", "label": "К₂ — средняя ставка", "input": "avg_rate_pct",
-             "rows": _rows((None, 0.146, 0.8), (0.146, 0.148, 0.9), (0.148, 0.1501, 1.0), (0.1501, None, 1.2))},
-            {"key": "k3", "label": "К₃ — CAC (отклонение от плана, %)", "input": "__cac_dev",
-             "rows": _rows((None, -20, 1.2), (-20, -10, 1.1), (-10, 10, 1.0), (10, 20, 0.85), (20, None, 0.7))},
-            {"key": "k4", "label": "К₄ — отзывы клиентов", "input": "neg_reviews",
-             "rows": _rows((0, 1, 1.0), (1, 2, 0.7), (2, 3, 0.5), (3, None, 0.0))},
-        ],
-        "zero_if": [],
-        "percent_scale": _rows(
-            (None, 70, 0.0, "порог не пройден"),
-            (70, 90, 0.40, "пониженная ставка"),
-            (90, 100, 0.55, "базовая ставка"),
-            (100, 110, 0.65, "целевая ставка"),
-            (110, None, 0.75, "повышенная ставка"),
-        ),
-    },
+FIELDS = {
+    "kd": [("volume_fact", "Объём факт, ₽", "money"), ("plan", "План, ₽", "money"),
+           ("discipline", "Дисциплинарные удержания, ₽", "money"),
+           ("spec_bonus", "Спецпремии, ₽", "money")],
+    "mop": [("volume_fact", "Объём факт, ₽", "money"), ("plan", "План, ₽", "money"),
+            ("rate_fact", "Средняя ставка факт, %", "pct"),
+            ("rate_plan", "Средняя ставка план, %", "pct"),
+            ("discipline", "Дисциплинарные удержания, ₽", "money"),
+            ("spec_bonus", "Спецпремии, ₽", "money")],
+    "and": [("contracts", "Активных договоров", "num"), ("yellow", "Доля жёлтой зоны", "pct"),
+            ("red", "Доля красной зоны", "pct"), ("to_sb", "Доля передач в СБ", "pct"),
+            ("lost", "Потерянных авто", "num"),
+            ("fine1", "Нарушение: проверка заявки > 2 ч", "num"),
+            ("fine2", "Нарушение: согласование авто > 2 ч", "num"),
+            ("fine3", "Нарушение: неполная карточка CRM", "num"),
+            ("fine4", "Нарушение: пропуск контрольной точки", "num"),
+            ("fine5", "Нарушение: проблемный лист", "num")],
+    "and_sr": [("contracts", "Активных договоров", "num"), ("yellow", "Доля жёлтой зоны", "pct"),
+               ("red", "Доля красной зоны", "pct"), ("to_sb", "Доля передач в СБ", "pct"),
+               ("lost", "Потерянных авто", "num"),
+               ("dept_red", "Красная зона департамента", "pct"),
+               ("dept_lost", "Потеряно авто в департаменте", "num"),
+               ("fine1", "Нарушение: проверка заявки > 2 ч", "num"),
+               ("fine2", "Нарушение: согласование авто > 2 ч", "num"),
+               ("fine3", "Нарушение: неполная карточка CRM", "num"),
+               ("fine4", "Нарушение: пропуск контрольной точки", "num"),
+               ("fine5", "Нарушение: проблемный лист", "num")],
+    "od": [("contracts", "Активных договоров", "num"), ("yellow", "Доля жёлтой зоны", "pct"),
+           ("red", "Доля красной зоны", "pct"), ("violations", "Нарушений SLA", "num"),
+           ("lost", "Потерянных авто", "num"),
+           ("fine1", "Нарушение: опоздание > 15 мин", "num"),
+           ("fine2", "Нарушение: поручение не исполнено", "num"),
+           ("fine3", "Нарушение: отчёт не сдан", "num"),
+           ("fine4", "Нарушение: жалоба смежного отдела", "num")],
+    "rep": [("visits", "Выездов на сделки", "num"), ("km", "Пробег, км", "num"),
+            ("video", "Видеоотчёт сдан (1/0)", "num"),
+            ("brand_rear", "Брендирование: заднее стекло (1/0)", "num"),
+            ("brand_side", "Брендирование: бока (1/0)", "num"),
+            ("fine1", "Отказ от выезда", "num"),
+            ("fine2", "Опоздание на сделку > 1 ч", "num"),
+            ("fine3", "Просрочка фото/видеоотчёта", "num"),
+            ("fine4", "Просрочка отправки оригиналов", "num"),
+            ("fine5", "Отсутствие документа (частичное)", "num"),
+            ("fine6", "Полное отсутствие документов", "num"),
+            ("fine7", "Жалоба клиента", "num"),
+            ("fine8", "Обнаружение маяка клиентом", "num"),
+            ("fine9", "Не установлен маяк", "num")],
+    "sb": [("closed", "Закрыто задач", "num"), ("total_tasks", "Задач в работе", "num"),
+           ("avg_days", "Средний срок закрытия, дней", "num"),
+           ("seizures", "Изъято авто", "num"),
+           ("collected", "Взыскано, ₽", "money")],
+    "adm": [("errors", "Ошибок казначейских", "num"), ("delays", "Просрочек", "num"),
+            ("smm", "План SMM выполнен (1/0)", "num")],
 }
-
-INPUT_HELP = {
-    "yellow_pct": "Доля портфеля в жёлтой зоне (ОПЗ 4–25 дней)",
-    "red_pct": "Доля портфеля в красной зоне (по триггерам)",
-    "sb_share_pct": "Доля договоров, переданных в СБ",
-    "contracts": "Количество активных договоров",
-    "lost_cars": "Авто, не возвращённые в управляемую зону за 1 месяц",
-    "avg_rate_pct": "Средневзвешенная ставка (например 0,153%)",
-    "cac": "Маркетинговые расходы / количество договоров",
-}
-
-
-def default_rules(role):
-    return deepcopy(DEFAULT_RULES[role])
-
-
-def param_value(rules, key, default=0.0):
-    for p in rules.get("params", []):
-        if p["key"] == key:
-            return p["value"]
-    return default
-
-
-def lookup(rows, x):
-    """Находит значение по шкале. from включительно, to — не включая."""
-    if not rows:
-        return 1.0
-    x = float(x or 0)
-    for r in rows:
-        lo, hi = r.get("from"), r.get("to")
-        if (lo is None or x >= lo) and (hi is None or x < hi):
-            return float(r["value"])
-    return float(rows[-1]["value"])
-
-
-def _sla_violations(rules, inp):
-    n = 0
-    if float(inp.get("avg_request_h") or 0) > param_value(rules, "sla_request_limit", 2):
-        n += 1
-    if float(inp.get("avg_auto_h") or 0) > param_value(rules, "sla_auto_limit", 2):
-        n += 1
-    if float(inp.get("overdue_events_pct") or 0) > param_value(rules, "sla_overdue_limit", 5):
-        n += 1
-    return n
-
-
-def _cac_dev(inp):
-    cac = float(inp.get("cac") or 0)
-    plan = float(inp.get("plan_cac") or 0)
-    if plan <= 0:
-        return 0.0
-    return (cac / plan - 1) * 100
-
-
-def _coeff_raw(rules, c, inp):
-    if "parts" in c:
-        return None
-    key = c.get("input")
-    if key == "__sla_violations":
-        return _sla_violations(rules, inp)
-    if key == "__cac_dev":
-        return _cac_dev(inp)
-    return float(inp.get(key) or 0)
-
-
-def compute(role, rules, inp):
-    """Возвращает подробный расчёт для одного сотрудника за месяц."""
-    base = param_value(rules, "base_salary")
-    disc = param_value(rules, "disc_salary")
-
-    # --- штрафы / дисциплинарные удержания
-    pen_total = 0.0
-    pen_lines = []
-    for p in rules.get("penalties", []):
-        cnt = float(inp.get(f"pen_{p['key']}") or 0)
-        if cnt:
-            amount = cnt * float(p["amount"])
-            pen_total += amount
-            pen_lines.append((f"{p['label']} × {int(cnt)}", -amount))
-
-    disc_after = max(0.0, disc - pen_total)
-    capped = min(pen_total, disc)
-
-    # --- коэффициенты
-    coeffs = {}
-    for c in rules.get("coeffs", []):
-        if "parts" in c:
-            val = 0.0
-            x = None
-            for part in c["parts"]:
-                px = float(inp.get(part["input"]) or 0)
-                val += lookup(part["rows"], px) * float(part.get("weight", 1))
-        else:
-            x = _coeff_raw(rules, c, inp)
-            val = lookup(c["rows"], x)
-        coeffs[c["key"]] = {"label": c["label"], "value": round(val, 4), "input": x}
-
-    prod = 1.0
-    for c in coeffs.values():
-        prod *= c["value"]
-
-    # --- стоп-факторы
-    zeroed = None
-    for z in rules.get("zero_if", []):
-        if float(inp.get(z["input"]) or 0) >= float(z.get("threshold", 1)):
-            zeroed = z.get("label", "стоп-фактор")
-            prod = 0.0
-
-    formula = rules.get("formula", "premium")
-    variable = 0.0
-    var_label = "Переменная часть"
-    base_var = 0.0
-    plan_pct = None
-    pct_rate = None
-    extras = 0.0
-    lines = []
-
-    if formula in ("premium", "premium_duty"):
-        base_var = param_value(rules, "base_premium")
-        if role == "Операционный директор" and param_value(rules, "premium_indexation", 0):
-            contracts = float(inp.get("contracts") or 0)
-            extra_steps = int(max(0, contracts - 400) // 100)
-            base_var += 4000 * extra_steps
-        variable = base_var * prod
-        var_label = "Переменная часть (личный портфель)"
-        lines.append(("Базовая премия", base_var))
-        for c in coeffs.values():
-            lines.append((c["label"], c["value"]))
-        if formula == "premium_duty":
-            duty = param_value(rules, "duty_allowance")
-            duty_prod = 1.0
-            if "k5" in coeffs:
-                duty_prod = coeffs["k5"]["value"]
-            for z in rules.get("duty_zero_if", []):
-                if float(inp.get(z["input"]) or 0) >= float(z.get("threshold", 1)):
-                    duty_prod = 0.0
-            extras = duty * duty_prod
-            lines.append(("Надбавка за дежурство (база)", duty))
-            lines.append(("Надбавка за дежурство к выплате", extras))
-
-    elif formula == "percent":
-        volume = float(inp.get("volume") or 0)
-        plan = float(inp.get("plan") or 0)
-        plan_pct = (volume / plan * 100) if plan > 0 else 0.0
-        pct_rate = lookup(rules.get("percent_scale", []), plan_pct)
-        base_var = volume * pct_rate / 100.0
-        variable = base_var * prod
-        var_label = "Переменная часть (процент от объёма)"
-        lines.append(("Выполнение плана", round(plan_pct, 1)))
-        lines.append(("Ставка, % от объёма", pct_rate))
-        lines.append(("База переменной части", base_var))
-        for c in coeffs.values():
-            lines.append((c["label"], c["value"]))
-        if role == "Коммерческий директор":
-            extras = float(inp.get("spetz") or 0)
-            lines.append(("Спецпремии", extras))
-
-    elif formula == "trip":
-        trips = float(inp.get("trips") or 0)
-        km = float(inp.get("km") or 0)
-        fuel_price = float(inp.get("fuel_price") or param_value(rules, "fuel_price") or 0)
-        fuel = km / 100.0 * param_value(rules, "fuel_per_100") * fuel_price
-        amort = km * param_value(rules, "amort_rate")
-        wash = param_value(rules, "wash") * (1 if float(inp.get("wash") or 0) >= 1 else 0)
-        brand_back = param_value(rules, "brand_back") * (1 if float(inp.get("brand_back") or 0) >= 1 else 0)
-        brand_side = param_value(rules, "brand_side") * (1 if float(inp.get("brand_side") or 0) >= 1 else 0)
-        trips_pay = trips * param_value(rules, "trip_rate")
-        variable = trips_pay
-        extras = fuel + amort + wash + brand_back + brand_side
-        var_label = "Бонус за выезды"
-        lines.append((f"Выезды × {param_value(rules, 'trip_rate'):,.0f} ₽", trips_pay))
-        lines.append(("ГСМ", fuel))
-        lines.append(("Амортизация", amort))
-        lines.append(("Мойка", wash))
-        lines.append(("Брендирование: заднее стекло", brand_back))
-        lines.append(("Брендирование: бока", brand_side))
-
-    total = base + disc_after + variable + extras
-
-    return {
-        "base": round(base, 2),
-        "disc_full": round(disc, 2),
-        "penalties": round(pen_total, 2),
-        "penalties_capped": round(capped, 2),
-        "disc_after": round(disc_after, 2),
-        "coefficients": coeffs,
-        "base_variable": round(base_var, 2),
-        "variable": round(variable, 2),
-        "extras": round(extras, 2),
-        "total": round(total, 2),
-        "plan_pct": round(plan_pct, 2) if plan_pct is not None else None,
-        "pct_rate": pct_rate,
-        "zeroed": zeroed,
-        "lines": lines,
-        "penalty_lines": pen_lines,
-        "var_label": var_label,
-    }

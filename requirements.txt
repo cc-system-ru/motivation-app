@@ -1,3 +1,4 @@
-streamlit
-pandas
-openpyxl
+Flask>=3.0
+gunicorn>=21.2
+openpyxl>=3.1
+reportlab>=4.0
